@@ -1,3 +1,17 @@
+# Stage 1: Build
+FROM node:20-slim AS builder
+
+RUN npm install -g bun
+
+WORKDIR /app
+COPY package.json bun.lock* ./
+RUN bun install --frozen-lockfile
+
+COPY tsconfig.json ./
+COPY src/ ./src/
+RUN bun run build
+
+# Stage 2: Runtime
 FROM node:20-slim
 
 RUN apt-get update && \
@@ -7,12 +21,9 @@ RUN apt-get update && \
 WORKDIR /app
 
 COPY package.json bun.lock* ./
-RUN npm install -g bun && bun install --frozen-lockfile
+RUN npm install -g bun && bun install --frozen-lockfile --production
 
-COPY src/ ./src/
-COPY tsconfig.json ./
-
-RUN bun run build
+COPY --from=builder /app/dist ./dist
 
 EXPOSE 5100
 
