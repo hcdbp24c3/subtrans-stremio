@@ -1,0 +1,8 @@
+services:
+  subtrans:
+    build: .
+    ports:
+      - "5100:5100"
+    environment:
+      - PORT=5100
+    restart: unless-stopped
