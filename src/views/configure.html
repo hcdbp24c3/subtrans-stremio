@@ -255,7 +255,7 @@
         params.set('lang', Array.from(selectedLangs).join(','));
       }
 
-      const manifestUrl = window.location.origin + '/manifest.json?config=' + params.toString();
+      const manifestUrl = window.location.origin + '/manifest.json?config=' + encodeURIComponent(params.toString());
       document.getElementById('manifestUrl').textContent = manifestUrl;
       document.getElementById('result').classList.add('show');
     }
