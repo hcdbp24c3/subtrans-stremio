@@ -1,10 +1,13 @@
 import { Router } from 'express';
-import { decodeConfig } from '../config.js';
+import { decodeConfig, AddonConfig } from '../config.js';
 import { fetchJson, fetchText } from '../lib/proxy.js';
 import { detectFormat, parseSubtitle } from '../lib/subtitle-parser.js';
 import { getVideoDuration, calculateOffset, adjustEntries } from '../lib/aligner.js';
 
 const router = Router();
+
+const MAX_SUBS_PER_LANG = 5;
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 interface Subtitle {
   id: string;
@@ -17,14 +20,68 @@ interface Manifest {
   transportUrl?: string;
 }
 
+// ── Cache ──────────────────────────────────────────────────────────
+interface CacheEntry {
+  data: { subtitles: Subtitle[] };
+  expires: number;
+}
+
+const cache = new Map<string, CacheEntry>();
+
+function cacheKey(config: AddonConfig, type: string, id: string): string {
+  return `${config.streamUrl}|${config.subUrl}|${type}|${id}`;
+}
+
+function getFromCache(key: string): { subtitles: Subtitle[] } | null {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expires) {
+    cache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function setCache(key: string, data: { subtitles: Subtitle[] }): void {
+  // Evict oldest if cache grows too large (>200 entries)
+  if (cache.size > 200) {
+    const oldest = cache.keys().next().value;
+    if (oldest) cache.delete(oldest);
+  }
+  cache.set(key, { data, expires: Date.now() + CACHE_TTL_MS });
+}
+
+// ── Helpers ────────────────────────────────────────────────────────
 async function getUpstreamBaseUrl(manifestUrl: string): Promise<string> {
   const manifest = await fetchJson<Manifest>(manifestUrl);
-  if (manifest?.transportUrl) {
-    return manifest.transportUrl;
-  }
+  if (manifest?.transportUrl) return manifest.transportUrl;
   return manifestUrl.replace(/\/manifest\.json$/, '');
 }
 
+function filterByLanguage(subs: Subtitle[], languages: string): Subtitle[] {
+  if (!languages) return subs; // empty = all languages
+
+  const allowed = new Set(
+    languages.split(',').map((l) => l.trim().toLowerCase()).filter(Boolean)
+  );
+  return subs.filter((s) => {
+    const lang = (s.lang || '').toLowerCase();
+    return allowed.has(lang);
+  });
+}
+
+function limitPerLanguage(subs: Subtitle[], limit: number): Subtitle[] {
+  const counts = new Map<string, number>();
+  return subs.filter((s) => {
+    const lang = (s.lang || 'unknown').toLowerCase();
+    const count = counts.get(lang) || 0;
+    if (count >= limit) return false;
+    counts.set(lang, count + 1);
+    return true;
+  });
+}
+
+// ── Route ──────────────────────────────────────────────────────────
 router.get('/subtitles/:type/:id', async (req, res) => {
   const configStr = req.query.config as string;
   if (!configStr) {
@@ -41,11 +98,19 @@ router.get('/subtitles/:type/:id', async (req, res) => {
   const { type, id } = req.params;
   const decodedId = decodeURIComponent(id);
 
-  // 1. Fetch manifest to discover correct base URLs
+  // 1. Check cache
+  const key = cacheKey(config, type, decodedId);
+  const cached = getFromCache(key);
+  if (cached) {
+    res.json(cached);
+    return;
+  }
+
+  // 2. Fetch manifest to discover correct base URLs
   const subBaseUrl = await getUpstreamBaseUrl(config.subUrl);
   const streamBaseUrl = await getUpstreamBaseUrl(config.streamUrl);
 
-  // 2. Fetch subtitle list from upstream sub addon
+  // 3. Fetch subtitle list from upstream sub addon
   const upstreamSubUrl = `${subBaseUrl}/subtitles/${type}/${decodedId}`;
   const subResponse = await fetchJson<{ subtitles: Subtitle[] }>(upstreamSubUrl);
 
@@ -54,7 +119,11 @@ router.get('/subtitles/:type/:id', async (req, res) => {
     return;
   }
 
-  // 3. Try to get video duration via ffprobe
+  // 4. Filter by language + limit per language
+  let subs = filterByLanguage(subResponse.subtitles, config.languages);
+  subs = limitPerLanguage(subs, MAX_SUBS_PER_LANG);
+
+  // 5. Try to get video duration via ffprobe
   const upstreamStreamUrl = `${streamBaseUrl}/stream/${type}/${decodedId}`;
   const streamResponse = await fetchJson<{ streams: Array<{ url?: string }> }>(upstreamStreamUrl);
   const videoUrl = streamResponse?.streams?.[0]?.url;
@@ -64,10 +133,10 @@ router.get('/subtitles/:type/:id', async (req, res) => {
     videoDuration = await getVideoDuration(videoUrl);
   }
 
-  // 3. Process each subtitle
+  // 6. Process each subtitle — align if needed
   const alignedSubtitles: Subtitle[] = [];
 
-  for (const sub of subResponse.subtitles) {
+  for (const sub of subs) {
     const format = detectFormat(sub.url);
     if (!format) {
       alignedSubtitles.push(sub);
@@ -103,9 +172,14 @@ router.get('/subtitles/:type/:id', async (req, res) => {
     alignedSubtitles.push(sub);
   }
 
-  res.json({ subtitles: alignedSubtitles });
+  // 7. Cache result
+  const result = { subtitles: alignedSubtitles };
+  setCache(key, result);
+
+  res.json(result);
 });
 
+// ── Serialization helpers ──────────────────────────────────────────
 function reSerialize(
   entries: Array<{ start: number; end: number; text: string }>,
   format: string

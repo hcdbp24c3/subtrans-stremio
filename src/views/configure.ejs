@@ -67,6 +67,11 @@
         <input type="text" id="subUrl" placeholder="https://example.com/sub/manifest.json" required>
         <div class="hint">URL to the subtitle addon's manifest.json</div>
       </div>
+      <div class="form-group">
+        <label for="languages">Languages (optional)</label>
+        <input type="text" id="languages" placeholder="en,vi,ja" >
+        <div class="hint">Comma-separated language codes. Leave empty for all languages. Max 5 subs per language.</div>
+      </div>
       <button type="submit">Generate Manifest URL</button>
     </form>
     <div class="result" id="result">
@@ -84,10 +89,12 @@
       e.preventDefault();
       const stream = document.getElementById('streamUrl').value.trim();
       const sub = document.getElementById('subUrl').value.trim();
+      const lang = document.getElementById('languages').value.trim();
       if (!stream || !sub) return;
       const params = new URLSearchParams();
       params.set('stream', stream);
       params.set('sub', sub);
+      if (lang) params.set('lang', lang);
       const base = window.location.origin;
       const manifestUrl = base + '/manifest.json?config=' + params.toString();
       document.getElementById('manifestUrl').textContent = manifestUrl;
