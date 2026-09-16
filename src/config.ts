@@ -1,14 +1,20 @@
 export interface AddonConfig {
-  streamUrl: string;
-  subUrl: string;
+  /** Stream addon manifest URLs (supports multiple) */
+  streamUrls: string[];
+  /** Subtitle addon manifest URLs (supports multiple) */
+  subUrls: string[];
   /** Comma-separated language codes, e.g. "en,vi,ja" — empty = all languages */
   languages: string;
 }
 
 export function encodeConfig(config: AddonConfig): string {
   const params = new URLSearchParams();
-  params.set('stream', config.streamUrl);
-  params.set('sub', config.subUrl);
+  for (const url of config.streamUrls) {
+    if (url) params.append('stream', url);
+  }
+  for (const url of config.subUrls) {
+    if (url) params.append('sub', url);
+  }
   if (config.languages) params.set('lang', config.languages);
   return params.toString();
 }
@@ -16,12 +22,12 @@ export function encodeConfig(config: AddonConfig): string {
 export function decodeConfig(queryString: string): AddonConfig | null {
   try {
     const params = new URLSearchParams(queryString);
-    const streamUrl = params.get('stream') || '';
-    const subUrl = params.get('sub') || '';
-    if (!streamUrl || !subUrl) return null;
+    const streamUrls = params.getAll('stream').filter(Boolean);
+    const subUrls = params.getAll('sub').filter(Boolean);
+    if (streamUrls.length === 0 || subUrls.length === 0) return null;
     return {
-      streamUrl,
-      subUrl,
+      streamUrls,
+      subUrls,
       languages: params.get('lang') || '',
     };
   } catch {

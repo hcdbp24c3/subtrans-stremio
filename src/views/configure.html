@@ -13,102 +13,266 @@
       min-height: 100vh;
       display: flex;
       justify-content: center;
-      align-items: center;
       padding: 20px;
     }
     .container {
       background: #16213e;
       border-radius: 12px;
-      padding: 40px;
-      max-width: 600px;
+      padding: 32px;
+      max-width: 650px;
       width: 100%;
       box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+      margin-top: 20px;
+      align-self: flex-start;
     }
-    h1 { text-align: center; margin-bottom: 8px; color: #e94560; }
-    .subtitle { text-align: center; color: #888; margin-bottom: 30px; font-size: 14px; }
-    .form-group { margin-bottom: 20px; }
-    label { display: block; margin-bottom: 6px; font-weight: 600; color: #ccc; }
-    .hint { font-size: 12px; color: #666; margin-top: 4px; }
-    input[type="text"] {
-      width: 100%; padding: 12px; border: 1px solid #333; border-radius: 6px;
-      background: #0f3460; color: #eee; font-size: 14px;
+    h1 { text-align: center; margin-bottom: 6px; color: #e94560; font-size: 22px; }
+    .subtitle { text-align: center; color: #888; margin-bottom: 24px; font-size: 13px; }
+
+    /* Tabs */
+    .tabs { display: flex; gap: 0; margin-bottom: 24px; border-bottom: 2px solid #0f3460; }
+    .tab {
+      flex: 1; padding: 12px; text-align: center; cursor: pointer;
+      font-weight: 600; font-size: 14px; color: #888;
+      border-bottom: 2px solid transparent; margin-bottom: -2px;
+      transition: all 0.2s;
     }
-    input[type="text"]:focus { outline: none; border-color: #e94560; }
-    button {
+    .tab:hover { color: #ccc; }
+    .tab.active { color: #e94560; border-bottom-color: #e94560; }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    /* Addon list */
+    .addon-list { display: flex; flex-direction: column; gap: 10px; }
+    .addon-item {
+      display: flex; gap: 8px; align-items: center;
+      background: #0f3460; border-radius: 8px; padding: 10px 12px;
+    }
+    .addon-item input {
+      flex: 1; padding: 10px; border: 1px solid #333; border-radius: 6px;
+      background: #16213e; color: #eee; font-size: 13px;
+    }
+    .addon-item input:focus { outline: none; border-color: #e94560; }
+    .btn-remove {
+      background: #c73650; color: white; border: none; border-radius: 6px;
+      width: 32px; height: 32px; font-size: 18px; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+    }
+    .btn-remove:hover { background: #a82040; }
+    .btn-add {
+      background: transparent; color: #4ecca3; border: 2px dashed #4ecca3;
+      border-radius: 8px; padding: 10px; font-size: 14px; cursor: pointer;
+      font-weight: 600; width: 100%;
+    }
+    .btn-add:hover { background: rgba(78,204,163,0.1); }
+
+    /* Language section */
+    .lang-section { margin-top: 24px; }
+    .lang-section label { display: block; margin-bottom: 8px; font-weight: 600; color: #ccc; font-size: 14px; }
+    .lang-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+    .lang-chip {
+      padding: 6px 12px; border-radius: 20px; font-size: 12px; cursor: pointer;
+      border: 1px solid #333; background: #0f3460; color: #ccc;
+      transition: all 0.2s; user-select: none;
+    }
+    .lang-chip:hover { border-color: #e94560; }
+    .lang-chip.selected { background: #e94560; color: white; border-color: #e94560; }
+    .lang-hint { font-size: 11px; color: #666; margin-top: 8px; }
+
+    /* Generate button */
+    .btn-generate {
       width: 100%; padding: 14px; background: #e94560; color: white; border: none;
-      border-radius: 6px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 10px;
+      border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer;
+      margin-top: 24px;
     }
-    button:hover { background: #c73650; }
-    .result { margin-top: 20px; padding: 16px; background: #0f3460; border-radius: 6px; display: none; }
+    .btn-generate:hover { background: #c73650; }
+
+    /* Result */
+    .result { margin-top: 20px; padding: 16px; background: #0f3460; border-radius: 8px; display: none; }
     .result.show { display: block; }
-    .result-url { word-break: break-all; font-family: monospace; font-size: 13px; color: #4ecca3; margin-top: 8px; }
-    .copy-btn {
+    .result-url {
+      word-break: break-all; font-family: monospace; font-size: 12px;
+      color: #4ecca3; margin-top: 8px; background: #16213e;
+      padding: 10px; border-radius: 6px; line-height: 1.5;
+    }
+    .btn-copy {
       margin-top: 10px; padding: 8px 16px; background: #4ecca3; color: #1a1a2e;
-      border: none; border-radius: 4px; cursor: pointer; font-weight: 600; width: auto;
+      border: none; border-radius: 4px; cursor: pointer; font-weight: 600;
     }
+    .btn-copy:hover { background: #3db893; }
     .install-section {
-      margin-top: 20px; padding: 16px; background: #0f3460; border-radius: 6px; display: none;
+      margin-top: 16px; padding: 14px; background: #16213e; border-radius: 6px;
+      font-size: 13px; color: #ccc;
     }
-    .install-section.show { display: block; }
+    .install-section strong { color: #eee; }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>🎬 Subtitle Alignment</h1>
     <p class="subtitle">Auto-align subtitles with video using ffprobe</p>
-    <form id="configForm">
-      <div class="form-group">
-        <label for="streamUrl">Stream Addon URL</label>
-        <input type="text" id="streamUrl" placeholder="https://example.com/stream/manifest.json" required>
-        <div class="hint">URL to the stream addon's manifest.json</div>
-      </div>
-      <div class="form-group">
-        <label for="subUrl">Subtitle Addon URL</label>
-        <input type="text" id="subUrl" placeholder="https://example.com/sub/manifest.json" required>
-        <div class="hint">URL to the subtitle addon's manifest.json</div>
-      </div>
-      <div class="form-group">
-        <label for="languages">Languages (optional)</label>
-        <input type="text" id="languages" placeholder="en,vi,ja" >
-        <div class="hint">Comma-separated language codes. Leave empty for all languages. Max 5 subs per language.</div>
-      </div>
-      <button type="submit">Generate Manifest URL</button>
-    </form>
+
+    <div class="tabs">
+      <div class="tab active" data-tab="stream" onclick="switchTab('stream')">🎬 Stream Addons</div>
+      <div class="tab" data-tab="sub" onclick="switchTab('sub')">📝 Subtitle Addons</div>
+    </div>
+
+    <div class="tab-content active" id="tab-stream">
+      <div class="addon-list" id="streamList"></div>
+      <button class="btn-add" onclick="addAddon('stream')">+ Add Stream Addon</button>
+    </div>
+
+    <div class="tab-content" id="tab-sub">
+      <div class="addon-list" id="subList"></div>
+      <button class="btn-add" onclick="addAddon('sub')">+ Add Subtitle Addon</button>
+    </div>
+
+    <div class="lang-section">
+      <label>Languages</label>
+      <div class="lang-grid" id="langGrid"></div>
+      <div class="lang-hint">Click to select languages. No selection = all languages. Max 5 subs per language.</div>
+    </div>
+
+    <button class="btn-generate" onclick="generate()">Generate Manifest URL</button>
+
     <div class="result" id="result">
       <strong>Your Manifest URL:</strong>
       <div class="result-url" id="manifestUrl"></div>
-      <button class="copy-btn" onclick="copyUrl()">Copy URL</button>
-    </div>
-    <div class="install-section" id="installSection">
-      <strong>Install in Stremio:</strong>
-      <p style="margin-top: 8px; font-size: 14px;">Open Stremio → Add-ons → Community → Paste the URL above</p>
+      <button class="btn-copy" onclick="copyUrl()">Copy URL</button>
+      <div class="install-section">
+        <strong>Install in Stremio:</strong><br>
+        Open Stremio → Add-ons → Community Addons → Paste the URL above
+      </div>
     </div>
   </div>
+
   <script>
-    document.getElementById('configForm').addEventListener('submit', function(e) {
-      e.preventDefault();
-      const stream = document.getElementById('streamUrl').value.trim();
-      const sub = document.getElementById('subUrl').value.trim();
-      const lang = document.getElementById('languages').value.trim();
-      if (!stream || !sub) return;
+    // ── Language data ──────────────────────────────────────────
+    const LANGUAGES = [
+      { code: 'en', label: 'English' },
+      { code: 'vi', label: 'Tiếng Việt' },
+      { code: 'ja', label: '日本語' },
+      { code: 'ko', label: '한국어' },
+      { code: 'zh', label: '中文' },
+      { code: 'th', label: 'ไทย' },
+      { code: 'id', label: 'Bahasa Indonesia' },
+      { code: 'ms', label: 'Bahasa Melayu' },
+      { code: 'fr', label: 'Français' },
+      { code: 'de', label: 'Deutsch' },
+      { code: 'es', label: 'Español' },
+      { code: 'pt', label: 'Português' },
+      { code: 'it', label: 'Italiano' },
+      { code: 'ru', label: 'Русский' },
+      { code: 'ar', label: 'العربية' },
+      { code: 'hi', label: 'हिन्दी' },
+      { code: 'tr', label: 'Türkçe' },
+      { code: 'pl', label: 'Polski' },
+      { code: 'nl', label: 'Nederlands' },
+      { code: 'sv', label: 'Svenska' },
+      { code: 'da', label: 'Dansk' },
+      { code: 'no', label: 'Norsk' },
+      { code: 'fi', label: 'Suomi' },
+      { code: 'uk', label: 'Українська' },
+      { code: 'cs', label: 'Čeština' },
+      { code: 'el', label: 'Ελληνικά' },
+      { code: 'ro', label: 'Română' },
+      { code: 'hu', label: 'Magyar' },
+      { code: 'he', label: 'עברית' },
+    ];
+
+    const selectedLangs = new Set();
+
+    // ── Init language chips ────────────────────────────────────
+    function initLanguages() {
+      const grid = document.getElementById('langGrid');
+      LANGUAGES.forEach(lang => {
+        const chip = document.createElement('div');
+        chip.className = 'lang-chip';
+        chip.dataset.code = lang.code;
+        chip.textContent = lang.label;
+        chip.onclick = () => {
+          if (selectedLangs.has(lang.code)) {
+            selectedLangs.delete(lang.code);
+            chip.classList.remove('selected');
+          } else {
+            selectedLangs.add(lang.code);
+            chip.classList.add('selected');
+          }
+        };
+        grid.appendChild(chip);
+      });
+    }
+
+    // ── Tab switching ──────────────────────────────────────────
+    function switchTab(tab) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+      document.querySelector(`.tab[data-tab="${tab}"]`).classList.add('active');
+      document.getElementById(`tab-${tab}`).classList.add('active');
+    }
+
+    // ── Addon management ───────────────────────────────────────
+    function addAddon(type, url) {
+      const list = document.getElementById(type === 'stream' ? 'streamList' : 'subList');
+      const item = document.createElement('div');
+      item.className = 'addon-item';
+      item.innerHTML = `
+        <input type="text" placeholder="https://example.com/manifest.json" value="${url || ''}">
+        <button class="btn-remove" onclick="removeAddon(this)" title="Remove">×</button>
+      `;
+      list.appendChild(item);
+    }
+
+    function removeAddon(btn) {
+      const list = btn.closest('.addon-list');
+      btn.closest('.addon-item').remove();
+      // Ensure at least one input remains
+      if (list.children.length === 0) {
+        addAddon(list.id === 'streamList' ? 'stream' : 'sub');
+      }
+    }
+
+    function getAddonUrls(type) {
+      const list = document.getElementById(type === 'stream' ? 'streamList' : 'subList');
+      return Array.from(list.querySelectorAll('input'))
+        .map(input => input.value.trim())
+        .filter(Boolean);
+    }
+
+    // ── Generate manifest URL ──────────────────────────────────
+    function generate() {
+      const streamUrls = getAddonUrls('stream');
+      const subUrls = getAddonUrls('sub');
+      if (streamUrls.length === 0 || subUrls.length === 0) {
+        alert('Please add at least one stream addon and one subtitle addon.');
+        return;
+      }
+
       const params = new URLSearchParams();
-      params.set('stream', stream);
-      params.set('sub', sub);
-      if (lang) params.set('lang', lang);
-      const base = window.location.origin;
-      const manifestUrl = base + '/manifest.json?config=' + params.toString();
+      streamUrls.forEach(url => params.append('stream', url));
+      subUrls.forEach(url => params.append('sub', url));
+      if (selectedLangs.size > 0) {
+        params.set('lang', Array.from(selectedLangs).join(','));
+      }
+
+      const manifestUrl = window.location.origin + '/manifest.json?config=' + params.toString();
       document.getElementById('manifestUrl').textContent = manifestUrl;
       document.getElementById('result').classList.add('show');
-      document.getElementById('installSection').classList.add('show');
-    });
+    }
+
     function copyUrl() {
       const url = document.getElementById('manifestUrl').textContent;
       navigator.clipboard.writeText(url).then(() => {
-        const btn = document.querySelector('.copy-btn');
+        const btn = document.querySelector('.btn-copy');
         btn.textContent = 'Copied!';
         setTimeout(() => btn.textContent = 'Copy URL', 2000);
       });
     }
+
+    // ── Init ───────────────────────────────────────────────────
+    initLanguages();
+    addAddon('stream');
+    addAddon('sub');
   </script>
 </body>
 </html>

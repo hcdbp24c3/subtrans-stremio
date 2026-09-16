@@ -29,7 +29,7 @@ interface CacheEntry {
 const cache = new Map<string, CacheEntry>();
 
 function cacheKey(config: AddonConfig, type: string, id: string): string {
-  return `${config.streamUrl}|${config.subUrl}|${type}|${id}`;
+  return `${config.streamUrls.join(',')}|${config.subUrls.join(',')}|${type}|${id}`;
 }
 
 function getFromCache(key: string): { subtitles: Subtitle[] } | null {
@@ -43,7 +43,6 @@ function getFromCache(key: string): { subtitles: Subtitle[] } | null {
 }
 
 function setCache(key: string, data: { subtitles: Subtitle[] }): void {
-  // Evict oldest if cache grows too large (>200 entries)
   if (cache.size > 200) {
     const oldest = cache.keys().next().value;
     if (oldest) cache.delete(oldest);
@@ -59,8 +58,7 @@ async function getUpstreamBaseUrl(manifestUrl: string): Promise<string> {
 }
 
 function filterByLanguage(subs: Subtitle[], languages: string): Subtitle[] {
-  if (!languages) return subs; // empty = all languages
-
+  if (!languages) return subs;
   const allowed = new Set(
     languages.split(',').map((l) => l.trim().toLowerCase()).filter(Boolean)
   );
@@ -106,37 +104,48 @@ router.get('/subtitles/:type/:id', async (req, res) => {
     return;
   }
 
-  // 2. Fetch manifest to discover correct base URLs
-  const subBaseUrl = await getUpstreamBaseUrl(config.subUrl);
-  const streamBaseUrl = await getUpstreamBaseUrl(config.streamUrl);
+  // 2. Fetch stream to get video URL for alignment (use first stream addon)
+  let videoDuration: number | null = null;
+  if (config.streamUrls.length > 0) {
+    try {
+      const streamBaseUrl = await getUpstreamBaseUrl(config.streamUrls[0]);
+      const upstreamStreamUrl = `${streamBaseUrl}/stream/${type}/${decodedId}`;
+      const streamResponse = await fetchJson<{ streams: Array<{ url?: string }> }>(upstreamStreamUrl);
+      const videoUrl = streamResponse?.streams?.[0]?.url;
+      if (videoUrl) {
+        videoDuration = await getVideoDuration(videoUrl);
+      }
+    } catch {
+      // Stream fetch failed — proceed without alignment
+    }
+  }
 
-  // 3. Fetch subtitle list from upstream sub addon
-  const upstreamSubUrl = `${subBaseUrl}/subtitles/${type}/${decodedId}`;
-  const subResponse = await fetchJson<{ subtitles: Subtitle[] }>(upstreamSubUrl);
+  // 3. Fetch subtitles from ALL upstream sub addons in parallel
+  const subResults = await Promise.allSettled(
+    config.subUrls.map(async (subUrl) => {
+      const subBaseUrl = await getUpstreamBaseUrl(subUrl);
+      const upstreamSubUrl = `${subBaseUrl}/subtitles/${type}/${decodedId}`;
+      const data = await fetchJson<{ subtitles: Subtitle[] }>(upstreamSubUrl);
+      return data?.subtitles || [];
+    })
+  );
 
-  if (!subResponse?.subtitles?.length) {
+  let allSubs = subResults
+    .filter((r): r is PromiseFulfilledResult<Subtitle[]> => r.status === 'fulfilled')
+    .flatMap((r) => r.value);
+
+  if (allSubs.length === 0) {
     res.json({ subtitles: [] });
     return;
   }
 
-  // 4. Filter by language + limit per language
-  let subs = filterByLanguage(subResponse.subtitles, config.languages);
-  subs = limitPerLanguage(subs, MAX_SUBS_PER_LANG);
+  // 4. Filter + limit
+  allSubs = filterByLanguage(allSubs, config.languages);
+  allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
 
-  // 5. Try to get video duration via ffprobe
-  const upstreamStreamUrl = `${streamBaseUrl}/stream/${type}/${decodedId}`;
-  const streamResponse = await fetchJson<{ streams: Array<{ url?: string }> }>(upstreamStreamUrl);
-  const videoUrl = streamResponse?.streams?.[0]?.url;
-
-  let videoDuration: number | null = null;
-  if (videoUrl) {
-    videoDuration = await getVideoDuration(videoUrl);
-  }
-
-  // 6. Process each subtitle — align if needed
+  // 5. Align subtitles if we have video duration
   const alignedSubtitles: Subtitle[] = [];
-
-  for (const sub of subs) {
+  for (const sub of allSubs) {
     const format = detectFormat(sub.url);
     if (!format) {
       alignedSubtitles.push(sub);
@@ -155,7 +164,6 @@ router.get('/subtitles/:type/:id', async (req, res) => {
       continue;
     }
 
-    // Calculate and apply offset if we have video duration
     if (videoDuration && videoDuration > 0) {
       const offset = calculateOffset(entries, videoDuration);
       if (offset !== 0) {
@@ -172,7 +180,7 @@ router.get('/subtitles/:type/:id', async (req, res) => {
     alignedSubtitles.push(sub);
   }
 
-  // 7. Cache result
+  // 6. Cache result
   const result = { subtitles: alignedSubtitles };
   setCache(key, result);
 
@@ -205,7 +213,6 @@ function reSerialize(
     return `WEBVTT\n\n${body}`;
   }
 
-  // ASS re-serialization is complex; pass through original
   return null;
 }
 
