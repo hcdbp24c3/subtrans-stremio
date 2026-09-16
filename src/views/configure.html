@@ -262,11 +262,25 @@
 
     function copyUrl() {
       const url = document.getElementById('manifestUrl').textContent;
-      navigator.clipboard.writeText(url).then(() => {
-        const btn = document.querySelector('.btn-copy');
+      const btn = document.querySelector('.btn-copy');
+      // Clipboard API requires HTTPS/localhost; fallback for HTTP
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(url).then(() => {
+          btn.textContent = 'Copied!';
+          setTimeout(() => btn.textContent = 'Copy URL', 2000);
+        });
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = url;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
         btn.textContent = 'Copied!';
         setTimeout(() => btn.textContent = 'Copy URL', 2000);
-      });
+      }
     }
 
     // ── Init ───────────────────────────────────────────────────
