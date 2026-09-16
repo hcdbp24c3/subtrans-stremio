@@ -57,13 +57,29 @@ async function getUpstreamBaseUrl(manifestUrl: string): Promise<string> {
   return manifestUrl.replace(/\/manifest\.json$/, '');
 }
 
+// ISO 639-2/B → 639-1 mapping for common subtitle languages
+const ISO639_2_TO_1: Record<string, string> = {
+  eng: 'en', vie: 'vi', jpn: 'ja', kor: 'ko', zho: 'zh', tha: 'th',
+  ind: 'id', msa: 'ms', fra: 'fr', deu: 'de', spa: 'es', por: 'pt',
+  ita: 'it', rus: 'ru', ara: 'ar', hin: 'hi', tur: 'tr', pol: 'pl',
+  nld: 'nl', swe: 'sv', dan: 'da', nor: 'no', fin: 'fi', ukr: 'uk',
+  ces: 'cs', ell: 'el', ron: 'ro', hun: 'hu', heb: 'he',
+};
+
+/** Normalize any language code (639-1 or 639-2) to 639-1 */
+function normalizeLang(code: string): string {
+  const lower = code.toLowerCase().trim();
+  if (lower.length <= 2) return lower;            // already 639-1
+  return ISO639_2_TO_1[lower] ?? lower;           // map or keep
+}
+
 function filterByLanguage(subs: Subtitle[], languages: string): Subtitle[] {
   if (!languages) return subs;
   const allowed = new Set(
-    languages.split(',').map((l) => l.trim().toLowerCase()).filter(Boolean)
+    languages.split(',').map((l) => normalizeLang(l)).filter(Boolean)
   );
   return subs.filter((s) => {
-    const lang = (s.lang || '').toLowerCase();
+    const lang = normalizeLang(s.lang || '');
     return allowed.has(lang);
   });
 }
@@ -71,7 +87,7 @@ function filterByLanguage(subs: Subtitle[], languages: string): Subtitle[] {
 function limitPerLanguage(subs: Subtitle[], limit: number): Subtitle[] {
   const counts = new Map<string, number>();
   return subs.filter((s) => {
-    const lang = (s.lang || 'unknown').toLowerCase();
+    const lang = normalizeLang(s.lang || 'unknown');
     const count = counts.get(lang) || 0;
     if (count >= limit) return false;
     counts.set(lang, count + 1);
@@ -124,7 +140,7 @@ router.get('/subtitles/:type/:id', async (req, res) => {
   const subResults = await Promise.allSettled(
     config.subUrls.map(async (subUrl) => {
       const subBaseUrl = await getUpstreamBaseUrl(subUrl);
-      const upstreamSubUrl = `${subBaseUrl}/subtitles/${type}/${decodedId}`;
+      const upstreamSubUrl = `${subBaseUrl}/subtitles/${type}/${decodedId}.json`;
       const data = await fetchJson<{ subtitles: Subtitle[] }>(upstreamSubUrl);
       return data?.subtitles || [];
     })

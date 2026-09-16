@@ -35,7 +35,7 @@ router.get('/stream/:type/:id', async (req, res) => {
   const results = await Promise.allSettled(
     config.streamUrls.map(async (streamUrl) => {
       const baseUrl = await getUpstreamBaseUrl(streamUrl);
-      const upstreamUrl = `${baseUrl}/stream/${type}/${decodedId}`;
+      const upstreamUrl = `${baseUrl}/stream/${type}/${decodedId}.json`;
       const data = await fetchJson<{ streams: Array<Record<string, unknown>> }>(upstreamUrl);
       return data?.streams || [];
     })
