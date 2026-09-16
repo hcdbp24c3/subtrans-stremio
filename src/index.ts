@@ -1,5 +1,4 @@
 import express from 'express';
-import configRoute from './routes/configure.js';
 import manifestRoute from './routes/manifestRoute.js';
 import streamRoute from './routes/stream.js';
 import subtitleRoute from './routes/subtitle.js';
@@ -15,7 +14,6 @@ app.set('trust proxy', true);
 app.use(express.json());
 
 // Routes
-app.use(configRoute);
 app.use(manifestRoute);
 app.use(streamRoute);
 app.use(subtitleRoute);

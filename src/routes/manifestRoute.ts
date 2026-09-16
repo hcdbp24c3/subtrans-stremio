@@ -1,11 +1,23 @@
 import express, { Router } from 'express';
 import { decodeConfig } from '../config.js';
 import { generateManifest } from '../manifest.js';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
 
+// Redirect root to /configure
+router.get('/', (_req, res) => {
+  res.redirect('/configure');
+});
+
+// Serve configure page
+router.get('/configure', (_req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'views', 'configure.html'));
+});
+
 function getBaseUrl(req: express.Request): string {
-  // Priority: BASE_URL env var > request headers
   const envBase = process.env.BASE_URL;
   if (envBase) return envBase.replace(/\/$/, '');
 

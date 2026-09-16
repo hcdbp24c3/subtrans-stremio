@@ -24,6 +24,7 @@ COPY package.json bun.lock* ./
 RUN npm install -g bun && bun install --frozen-lockfile --production
 
 COPY --from=builder /app/dist ./dist
+COPY src/views/ ./dist/views/
 
 EXPOSE 5100
 
