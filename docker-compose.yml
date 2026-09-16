@@ -5,4 +5,5 @@ services:
       - "5100:5100"
     environment:
       - PORT=5100
+      - BASE_URL=http://oeoazmu2vg2g7wxolz7ghghq.216.238.121.177.sslip.io
     restart: unless-stopped

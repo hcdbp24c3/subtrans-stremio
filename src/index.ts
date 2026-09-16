@@ -6,6 +6,10 @@ import subtitleRoute from './routes/subtitle.js';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '5100', 10);
+const BASE_URL = process.env.BASE_URL || ''; // e.g. "https://example.com"
+
+// Trust proxy for correct req.protocol behind reverse proxy
+app.set('trust proxy', true);
 
 // Middleware
 app.use(express.json());
@@ -22,6 +26,8 @@ app.get('/health', (_req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
+  const display = BASE_URL || `http://localhost:${PORT}`;
   console.log(`🎬 Subtitle Alignment Addon running on http://0.0.0.0:${PORT}`);
-  console.log(`   Configure: http://localhost:${PORT}/configure`);
+  console.log(`   External: ${display}`);
+  console.log(`   Configure: ${display}/configure`);
 });

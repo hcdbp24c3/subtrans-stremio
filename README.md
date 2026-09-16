@@ -58,6 +58,7 @@ Stremio → Alignment Addon → Stream Addon (proxy)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | PORT | 5100 | Server port |
+| BASE_URL | (auto-detect) | External URL, e.g. `https://my-server.com` — used for manifest transport URL behind reverse proxy |
 
 ## License
 
