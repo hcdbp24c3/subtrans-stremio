@@ -12,6 +12,19 @@ interface Subtitle {
   lang?: string;
 }
 
+interface Manifest {
+  id: string;
+  transportUrl?: string;
+}
+
+async function getUpstreamBaseUrl(manifestUrl: string): Promise<string> {
+  const manifest = await fetchJson<Manifest>(manifestUrl);
+  if (manifest?.transportUrl) {
+    return manifest.transportUrl;
+  }
+  return manifestUrl.replace(/\/manifest\.json$/, '');
+}
+
 router.get('/subtitles/:type/:id', async (req, res) => {
   const configStr = req.query.config as string;
   if (!configStr) {
@@ -28,8 +41,12 @@ router.get('/subtitles/:type/:id', async (req, res) => {
   const { type, id } = req.params;
   const decodedId = decodeURIComponent(id);
 
-  // 1. Fetch subtitle list from upstream sub addon
-  const upstreamSubUrl = `${config.subUrl.replace(/\/manifest\.json$/, '')}/subtitles/${type}/${decodedId}`;
+  // 1. Fetch manifest to discover correct base URLs
+  const subBaseUrl = await getUpstreamBaseUrl(config.subUrl);
+  const streamBaseUrl = await getUpstreamBaseUrl(config.streamUrl);
+
+  // 2. Fetch subtitle list from upstream sub addon
+  const upstreamSubUrl = `${subBaseUrl}/subtitles/${type}/${decodedId}`;
   const subResponse = await fetchJson<{ subtitles: Subtitle[] }>(upstreamSubUrl);
 
   if (!subResponse?.subtitles?.length) {
@@ -37,9 +54,8 @@ router.get('/subtitles/:type/:id', async (req, res) => {
     return;
   }
 
-  // 2. Try to get video duration via ffprobe
-  // Fetch stream URL from upstream for ffprobe
-  const upstreamStreamUrl = `${config.streamUrl.replace(/\/manifest\.json$/, '')}/stream/${type}/${decodedId}`;
+  // 3. Try to get video duration via ffprobe
+  const upstreamStreamUrl = `${streamBaseUrl}/stream/${type}/${decodedId}`;
   const streamResponse = await fetchJson<{ streams: Array<{ url?: string }> }>(upstreamStreamUrl);
   const videoUrl = streamResponse?.streams?.[0]?.url;
 
