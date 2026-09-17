@@ -29,7 +29,8 @@ router.get('/stream/:type/:id', async (req, res) => {
   }
 
   const { type, id } = req.params;
-  const decodedId = decodeURIComponent(id);
+  // Stremio appends .json to resource URLs (/stream/movie/tt123.json)
+  const decodedId = decodeURIComponent(id).replace(/\.json$/, '');
 
   // Fetch streams from all upstream addons in parallel, merge results
   const results = await Promise.allSettled(

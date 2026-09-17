@@ -110,7 +110,9 @@ router.get('/subtitles/:type/:id', async (req, res) => {
   }
 
   const { type, id } = req.params;
-  const decodedId = decodeURIComponent(id);
+  // Stremio appends .json to resource URLs (/subtitles/movie/tt123.json)
+  // Strip it so we get the raw IMDb ID for upstream queries
+  const decodedId = decodeURIComponent(id).replace(/\.json$/, '');
 
   // 1. Check cache
   const key = cacheKey(config, type, decodedId);
