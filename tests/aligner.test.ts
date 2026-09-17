@@ -1,38 +1,137 @@
 import { describe, it, expect } from 'vitest';
-import { calculateOffset, adjustEntries, SubtitleEntry } from '../src/lib/aligner.js';
+import { calculateOffsetFromReference, calculateOffsetFromDuration, adjustEntries, SubtitleEntry } from '../src/lib/aligner.js';
 
 describe('aligner', () => {
-  it('calculates positive offset when sub is shorter than video', () => {
-    const entries: SubtitleEntry[] = [
-      { start: 0, end: 2, text: 'a' },
-      { start: 3, end: 5, text: 'b' },
+  // ── calculateOffsetFromReference ──────────────────────────────────
+
+  it('detects positive offset (target starts early)', () => {
+    // Reference subs start at 10s, target starts at 5s → offset = +5s
+    const reference: SubtitleEntry[] = [
+      { start: 10, end: 12, text: 'Hello world' },
+      { start: 20, end: 22, text: 'How are you' },
+      { start: 30, end: 32, text: 'Good morning' },
+      { start: 40, end: 42, text: 'Thank you' },
+      { start: 50, end: 52, text: 'Goodbye' },
     ];
-    const offset = calculateOffset(entries, 10);
+    const target: SubtitleEntry[] = [
+      { start: 5, end: 7, text: 'Hello world' },
+      { start: 15, end: 17, text: 'How are you' },
+      { start: 25, end: 27, text: 'Good morning' },
+      { start: 35, end: 37, text: 'Thank you' },
+      { start: 45, end: 47, text: 'Goodbye' },
+    ];
+    const offset = calculateOffsetFromReference(reference, target);
     expect(offset).toBe(5);
   });
 
-  it('calculates negative offset when sub is longer than video', () => {
-    const entries: SubtitleEntry[] = [
-      { start: 0, end: 2, text: 'a' },
-      { start: 3, end: 15, text: 'b' },
+  it('detects negative offset (target starts late)', () => {
+    // Reference subs start at 5s, target starts at 10s → offset = -5s
+    const reference: SubtitleEntry[] = [
+      { start: 5, end: 7, text: 'Hello world' },
+      { start: 15, end: 17, text: 'How are you' },
+      { start: 25, end: 27, text: 'Good morning' },
+      { start: 35, end: 37, text: 'Thank you' },
+      { start: 45, end: 47, text: 'Goodbye' },
     ];
-    const offset = calculateOffset(entries, 10);
+    const target: SubtitleEntry[] = [
+      { start: 10, end: 12, text: 'Hello world' },
+      { start: 20, end: 22, text: 'How are you' },
+      { start: 30, end: 32, text: 'Good morning' },
+      { start: 40, end: 42, text: 'Thank you' },
+      { start: 50, end: 52, text: 'Goodbye' },
+    ];
+    const offset = calculateOffsetFromReference(reference, target);
     expect(offset).toBe(-5);
   });
 
-  it('returns 0 when sub timing matches video', () => {
+  it('returns 0 when entries are identical', () => {
     const entries: SubtitleEntry[] = [
-      { start: 0, end: 5, text: 'a' },
-      { start: 5, end: 10, text: 'b' },
+      { start: 5, end: 7, text: 'Hello' },
+      { start: 10, end: 12, text: 'World' },
+      { start: 15, end: 17, text: 'Foo' },
+      { start: 20, end: 22, text: 'Bar' },
+      { start: 25, end: 27, text: 'Baz' },
     ];
-    const offset = calculateOffset(entries, 10);
+    const offset = calculateOffsetFromReference(entries, [...entries]);
     expect(offset).toBe(0);
   });
 
   it('returns 0 when entries are empty', () => {
-    const offset = calculateOffset([], 100);
+    expect(calculateOffsetFromReference([], [])).toBe(0);
+  });
+
+  it('returns 0 when no matching text found', () => {
+    const reference: SubtitleEntry[] = [
+      { start: 10, end: 12, text: 'Apple banana cherry' },
+      { start: 20, end: 22, text: 'Dog cat fish bird' },
+      { start: 30, end: 32, text: 'Red green blue yellow' },
+      { start: 40, end: 42, text: 'One two three four five' },
+      { start: 50, end: 52, text: 'Alpha beta gamma delta' },
+    ];
+    const target: SubtitleEntry[] = [
+      { start: 10, end: 12, text: 'XXXX YYYY ZZZZ' },
+      { start: 20, end: 22, text: 'AAAA BBBB CCCC' },
+      { start: 30, end: 32, text: 'DDDD EEEE FFFF' },
+    ];
+    const offset = calculateOffsetFromReference(reference, target);
     expect(offset).toBe(0);
   });
+
+  it('ignores offsets larger than 10 minutes', () => {
+    const reference: SubtitleEntry[] = [
+      { start: 10, end: 12, text: 'Hello' },
+      { start: 20, end: 22, text: 'World' },
+      { start: 30, end: 32, text: 'Foo' },
+      { start: 40, end: 42, text: 'Bar' },
+      { start: 50, end: 52, text: 'Baz' },
+    ];
+    // 20 minutes offset → should return 0
+    const target: SubtitleEntry[] = [
+      { start: -1190, end: -1188, text: 'Hello' },
+      { start: -1180, end: -1178, text: 'World' },
+      { start: -1170, end: -1168, text: 'Foo' },
+      { start: -1160, end: -1158, text: 'Bar' },
+      { start: -1150, end: -1148, text: 'Baz' },
+    ];
+    const offset = calculateOffsetFromReference(reference, target);
+    expect(offset).toBe(0);
+  });
+
+  // ── calculateOffsetFromDuration ──────────────────────────────────
+
+  it('detects offset when sub ends early vs video', () => {
+    // Sub ends at 7400s but video is 7700s → offset = +300s
+    const entries: SubtitleEntry[] = [
+      { start: 60, end: 62, text: 'first' },
+      { start: 7390, end: 7400, text: 'last' },
+    ];
+    const offset = calculateOffsetFromDuration(entries, 7700);
+    expect(offset).toBe(300);
+  });
+
+  it('detects negative offset when sub extends past video', () => {
+    const entries: SubtitleEntry[] = [
+      { start: 60, end: 62, text: 'first' },
+      { start: 7700, end: 7710, text: 'last' },
+    ];
+    const offset = calculateOffsetFromDuration(entries, 7700);
+    expect(offset).toBe(-10);
+  });
+
+  it('returns 0 for small differences', () => {
+    const entries: SubtitleEntry[] = [
+      { start: 60, end: 62, text: 'first' },
+      { start: 7698, end: 7700, text: 'last' },
+    ];
+    const offset = calculateOffsetFromDuration(entries, 7700);
+    expect(offset).toBe(0);
+  });
+
+  it('returns 0 when entries are empty', () => {
+    expect(calculateOffsetFromDuration([], 7700)).toBe(0);
+  });
+
+  // ── adjustEntries ─────────────────────────────────────────────────
 
   it('adjusts entries with given offset', () => {
     const entries: SubtitleEntry[] = [

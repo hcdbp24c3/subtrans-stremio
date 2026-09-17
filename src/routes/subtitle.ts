@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { decodeConfig, encodeConfig, AddonConfig } from '../config.js';
 import { fetchJson, fetchText } from '../lib/proxy.js';
 import { detectFormat, parseSubtitle, SubtitleFormat } from '../lib/subtitle-parser.js';
-import { getVideoDuration, calculateOffset, adjustEntries } from '../lib/aligner.js';
+import { calculateOffsetFromReference, calculateOffsetFromDuration, getVideoDuration, adjustEntries } from '../lib/aligner.js';
 
 const router = Router();
 
@@ -63,6 +63,18 @@ function detectFileExt(url: string): string {
   } catch {}
   // Default to .srt (most common subtitle format)
   return '.srt';
+}
+
+/** Extract real download URL from SubSense local proxy URLs */
+function resolveRealUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const from = parsed.searchParams.get('from');
+    if (from && (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost')) {
+      return from;
+    }
+  } catch {}
+  return url;
 }
 
 async function getUpstreamBaseUrl(manifestUrl: string): Promise<string> {
@@ -138,17 +150,37 @@ router.get('/subtitles/:type/:id', async (req, res) => {
 
   // 2. Fetch stream to get video URL for alignment (use first stream addon)
   let videoDuration: number | null = null;
+  let refSubs: Subtitle[] = [];
+
   if (config.streamUrls.length > 0) {
     try {
       const streamBaseUrl = await getUpstreamBaseUrl(config.streamUrls[0]);
-      const upstreamStreamUrl = `${streamBaseUrl}/stream/${type}/${decodedId}`;
-      const streamResponse = await fetchJson<{ streams: Array<{ url?: string }> }>(upstreamStreamUrl);
-      const videoUrl = streamResponse?.streams?.[0]?.url;
-      if (videoUrl) {
-        videoDuration = await getVideoDuration(videoUrl);
+
+      // Try to get video URL for ffprobe-based alignment
+      try {
+        const upstreamStreamUrl = `${streamBaseUrl}/stream/${type}/${decodedId}`;
+        const streamResponse = await fetchJson<{ streams: Array<{ url?: string }> }>(upstreamStreamUrl);
+        const videoUrl = streamResponse?.streams?.[0]?.url;
+        if (videoUrl) {
+          videoDuration = await getVideoDuration(videoUrl);
+          if (videoDuration) {
+            console.log(`[subtitle] Video duration: ${videoDuration.toFixed(1)}s`);
+          }
+        }
+      } catch {
+        // Stream fetch failed — proceed without duration
+      }
+
+      // Also try to get reference subtitles from stream addon
+      try {
+        const upstreamSubUrl = `${streamBaseUrl}/subtitles/${type}/${decodedId}.json`;
+        const data = await fetchJson<{ subtitles: Subtitle[] }>(upstreamSubUrl);
+        refSubs = data?.subtitles || [];
+      } catch {
+        // Stream addon doesn't support subtitles resource
       }
     } catch {
-      // Stream fetch failed — proceed without alignment
+      // Stream addon manifest fetch failed
     }
   }
 
@@ -175,59 +207,132 @@ router.get('/subtitles/:type/:id', async (req, res) => {
   allSubs = filterByLanguage(allSubs, config.languages);
   allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
 
-  // 5. Detect format + rewrite subtitle URLs to go through our download proxy
-  //    (upstream addons like SubSense return 127.0.0.1 URLs that only work locally)
-  const base = `${req.protocol}://${req.headers.host || 'localhost'}`;
-  const configParam = encodeURIComponent(encodeConfig(config));
-  allSubs = allSubs.map((sub) => {
-    const ext = detectFileExt(sub.url);
-    return {
-      ...sub,
-      _format: detectFormat(sub.url) || undefined,
-      url: `${base}/subdownload${ext}?url=${encodeURIComponent(sub.url)}&config=${configParam}`,
-    } as Subtitle;
-  });
+  // 5. Detect format for alignment (BEFORE URL rewrite — all URLs are still original upstream URLs)
+  allSubs = allSubs.map((sub) => ({
+    ...sub,
+    _format: detectFormat(sub.url) || undefined,
+  })) as Subtitle[];
 
-  // 6. Align subtitles if we have video duration
-  const alignedSubtitles: Subtitle[] = [];
-  for (const sub of allSubs) {
-    const format = sub._format as SubtitleFormat | null;
-    if (!format) {
-      alignedSubtitles.push(sub);
-      continue;
+  // 6. Calculate alignment offset using multiple strategies:
+  //    Downloads use ORIGINAL upstream URLs (before proxy rewrite)
+  let offset = 0;
+
+  // Strategy A: Reference subtitle comparison
+  if (refSubs.length > 0 && allSubs.length > 0) {
+    const refByLang = new Map<string, Subtitle[]>();
+    for (const s of refSubs) {
+      const lang = normalizeLang(s.lang || '');
+      if (!refByLang.has(lang)) refByLang.set(lang, []);
+      refByLang.get(lang)!.push(s);
+    }
+    const ourByLang = new Map<string, Subtitle[]>();
+    for (const s of allSubs) {
+      const lang = normalizeLang(s.lang || '');
+      if (!ourByLang.has(lang)) ourByLang.set(lang, []);
+      ourByLang.get(lang)!.push(s);
     }
 
-    const subContent = await fetchText(sub.url);
-    if (!subContent) {
-      alignedSubtitles.push(sub);
-      continue;
-    }
+    const offsets: number[] = [];
+    for (const [lang, refLangSubs] of refByLang) {
+      const ourLangSubs = ourByLang.get(lang);
+      if (!ourLangSubs || ourLangSubs.length === 0) continue;
 
-    const entries = parseSubtitle(subContent, format);
-    if (entries.length === 0) {
-      alignedSubtitles.push(sub);
-      continue;
-    }
+      for (const refSub of refLangSubs.slice(0, 2)) {
+        const refFormat = detectFormat(refSub.url);
+        if (!refFormat) continue;
+        const refContent = await fetchText(refSub.url);
+        if (!refContent) continue;
+        const refEntries = parseSubtitle(refContent, refFormat);
+        if (refEntries.length === 0) continue;
 
-    if (videoDuration && videoDuration > 0) {
-      const offset = calculateOffset(entries, videoDuration);
-      if (offset !== 0) {
-        const adjusted = adjustEntries(entries, offset);
-        const adjustedContent = reSerialize(adjusted, format);
-        if (adjustedContent) {
-          const dataUrl = `data:text/plain;base64,${Buffer.from(adjustedContent).toString('base64')}`;
-          alignedSubtitles.push({ ...sub, url: dataUrl });
-          continue;
+        for (const ourSub of ourLangSubs.slice(0, 2)) {
+          const ourFormat = ourSub._format || 'srt' as SubtitleFormat;
+          const ourRealUrl = resolveRealUrl(ourSub.url);
+          const ourContent = await fetchText(ourRealUrl);
+          if (!ourContent) continue;
+          const ourEntries = parseSubtitle(ourContent, ourFormat);
+          if (ourEntries.length === 0) continue;
+
+          const pairOffset = calculateOffsetFromReference(refEntries, ourEntries);
+          if (pairOffset !== 0) offsets.push(pairOffset);
         }
       }
     }
 
+    if (offsets.length > 0) {
+      offsets.sort((a, b) => a - b);
+      offset = offsets[Math.floor(offsets.length / 2)];
+    }
+  }
+
+  // Strategy B: Duration-based alignment (if no reference offset found)
+  if (offset === 0 && videoDuration && videoDuration > 0) {
+    for (const sub of allSubs.slice(0, 3)) {
+      const format = sub._format || 'srt' as SubtitleFormat;
+      const realUrl = resolveRealUrl(sub.url);
+      const content = await fetchText(realUrl);
+      if (!content) continue;
+      const entries = parseSubtitle(content, format);
+      if (entries.length === 0) continue;
+
+      offset = calculateOffsetFromDuration(entries, videoDuration);
+      if (offset !== 0) break;
+    }
+  }
+
+  console.log(`[subtitle] Alignment: offset=${offset.toFixed(1)}s, duration=${videoDuration?.toFixed(0) ?? 'none'}s, subs=${allSubs.length}`);
+
+  // 7. If offset detected, re-download all subs and re-serialize with offset applied
+  //    (using resolved upstream URLs for download)
+  const alignedSubtitles: Subtitle[] = [];
+  for (const sub of allSubs) {
+    if (offset !== 0) {
+      const format = (sub._format || 'srt') as SubtitleFormat | null;
+      if (format) {
+        const realUrl = resolveRealUrl(sub.url);
+        const subContent = await fetchText(realUrl);
+        if (subContent) {
+          let adjustedContent: string | null = null;
+
+          if (format === 'ass') {
+            // ASS/SSA: adjust timestamps in-place on raw text (preserves styling)
+            adjustedContent = adjustAssTimestamps(subContent, offset);
+          } else {
+            // SRT/VTT: parse → adjust → re-serialize
+            const entries = parseSubtitle(subContent, format);
+            if (entries.length > 0) {
+              const adjusted = adjustEntries(entries, offset);
+              adjustedContent = reSerialize(adjusted, format);
+            }
+          }
+
+          if (adjustedContent) {
+            const dataUrl = `data:text/plain;base64,${Buffer.from(adjustedContent).toString('base64')}`;
+            alignedSubtitles.push({ ...sub, url: dataUrl });
+            continue;
+          }
+        }
+      }
+    }
     alignedSubtitles.push(sub);
   }
 
-  // 6. Cache result (strip internal _format fields)
+  // 8. NOW rewrite URLs to proxy format (all content downloads are done)
+  const base = `${req.protocol}://${req.headers.host || 'localhost'}`;
+  const configParam = encodeURIComponent(encodeConfig(config));
+  const finalSubtitles = alignedSubtitles.map((sub) => {
+    // Skip data URLs (already encoded) or proxy URLs (already rewritten)
+    if (sub.url.startsWith('data:') || sub.url.startsWith(base)) {
+      return { ...sub } as Subtitle;
+    }
+    const ext = detectFileExt(sub.url);
+    return {
+      ...sub,
+      url: `${base}/subdownload${ext}?url=${encodeURIComponent(sub.url)}&config=${configParam}`,
+    } as Subtitle;
+  });
   const result = {
-    subtitles: alignedSubtitles.map(({ _format, ...rest }) => rest),
+    subtitles: finalSubtitles.map(({ _format, ...rest }) => rest),
   };
   setCache(key, result);
 
@@ -340,7 +445,46 @@ function reSerialize(
     return `WEBVTT\n\n${body}`;
   }
 
+  // ASS/SSA: handled separately via adjustAssTimestamps
   return null;
+}
+
+/** Format seconds to ASS timestamp H:MM:SS.cc */
+function formatAssTime(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  const cs = Math.round((seconds % 1) * 100);
+  return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
+}
+
+/** Parse ASS timestamp H:MM:SS.cc to seconds */
+function parseAssTime(ts: string): number {
+  const match = ts.match(/(\d+):(\d+):(\d+)\.(\d+)/);
+  if (!match) return 0;
+  return parseInt(match[1]) * 3600 + parseInt(match[2]) * 60 + parseInt(match[3]) + parseInt(match[4]) / 100;
+}
+
+/**
+ * Adjust ASS/SSA timestamps in-place on raw content.
+ * Only modifies Dialogue lines — preserves all styles, events, headers.
+ */
+export function adjustAssTimestamps(raw: string, offset: number): string {
+  const lines = raw.split('\n');
+  return lines.map(line => {
+    if (!line.startsWith('Dialogue:')) return line;
+    // ASS Dialogue: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+    const parts = line.split(',');
+    if (parts.length < 10) return line;
+    // Start is index 1, End is index 2
+    const startSec = parseAssTime(parts[1]);
+    const endSec = parseAssTime(parts[2]);
+    const newStart = Math.max(0, startSec + offset);
+    const newEnd = Math.max(0, endSec + offset);
+    parts[1] = formatAssTime(newStart);
+    parts[2] = formatAssTime(newEnd);
+    return parts.join(',');
+  }).join('\n');
 }
 
 function formatSrtTime(seconds: number): string {
