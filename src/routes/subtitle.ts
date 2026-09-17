@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { decodeConfig, encodeConfig, AddonConfig } from '../config.js';
 import { fetchJson, fetchText } from '../lib/proxy.js';
-import { detectFormat, parseSubtitle } from '../lib/subtitle-parser.js';
+import { detectFormat, parseSubtitle, SubtitleFormat } from '../lib/subtitle-parser.js';
 import { getVideoDuration, calculateOffset, adjustEntries } from '../lib/aligner.js';
 
 const router = Router();
@@ -13,6 +13,7 @@ interface Subtitle {
   id: string;
   url: string;
   lang?: string;
+  _format?: SubtitleFormat;
 }
 
 interface Manifest {
@@ -51,6 +52,19 @@ function setCache(key: string, data: { subtitles: Subtitle[] }): void {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
+
+/** Detect file extension from upstream URL for Nuvio format detection */
+function detectFileExt(url: string): string {
+  // Check for known extensions in the URL path (not query params)
+  try {
+    const pathname = new URL(url).pathname.toLowerCase();
+    if (pathname.endsWith('.vtt') || pathname.includes('.vtt?')) return '.vtt';
+    if (pathname.endsWith('.ass') || pathname.endsWith('.ssa') || pathname.includes('.ass?') || pathname.includes('.ssa?')) return '.ass';
+  } catch {}
+  // Default to .srt (most common subtitle format)
+  return '.srt';
+}
+
 async function getUpstreamBaseUrl(manifestUrl: string): Promise<string> {
   const manifest = await fetchJson<Manifest>(manifestUrl);
   if (manifest?.transportUrl) return manifest.transportUrl;
@@ -161,19 +175,23 @@ router.get('/subtitles/:type/:id', async (req, res) => {
   allSubs = filterByLanguage(allSubs, config.languages);
   allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
 
-  // 5. Rewrite subtitle URLs to go through our download proxy
+  // 5. Detect format + rewrite subtitle URLs to go through our download proxy
   //    (upstream addons like SubSense return 127.0.0.1 URLs that only work locally)
   const base = `${req.protocol}://${req.headers.host || 'localhost'}`;
   const configParam = encodeURIComponent(encodeConfig(config));
-  allSubs = allSubs.map((sub) => ({
-    ...sub,
-    url: `${base}/subdownload?url=${encodeURIComponent(sub.url)}&config=${configParam}`,
-  }));
+  allSubs = allSubs.map((sub) => {
+    const ext = detectFileExt(sub.url);
+    return {
+      ...sub,
+      _format: detectFormat(sub.url) || undefined,
+      url: `${base}/subdownload${ext}?url=${encodeURIComponent(sub.url)}&config=${configParam}`,
+    } as Subtitle;
+  });
 
   // 6. Align subtitles if we have video duration
   const alignedSubtitles: Subtitle[] = [];
   for (const sub of allSubs) {
-    const format = detectFormat(sub.url);
+    const format = sub._format as SubtitleFormat | null;
     if (!format) {
       alignedSubtitles.push(sub);
       continue;
@@ -207,8 +225,10 @@ router.get('/subtitles/:type/:id', async (req, res) => {
     alignedSubtitles.push(sub);
   }
 
-  // 6. Cache result
-  const result = { subtitles: alignedSubtitles };
+  // 6. Cache result (strip internal _format fields)
+  const result = {
+    subtitles: alignedSubtitles.map(({ _format, ...rest }) => rest),
+  };
   setCache(key, result);
 
   res.json(result);
@@ -217,7 +237,9 @@ router.get('/subtitles/:type/:id', async (req, res) => {
 // ── Subtitle download proxy ───────────────────────────────────────
 // Upstream addons (SubSense) return 127.0.0.1 URLs that only work locally.
 // This endpoint proxies the download so Nuvio/browser can fetch it.
-router.get('/subdownload', async (req, res) => {
+// URL format: /subdownload.srt?url=...&config=...
+// The .srt/.vtt/.ass extension helps Nuvio detect subtitle format.
+async function handleSubDownload(req: any, res: any) {
   const url = req.query.url as string;
   if (!url) {
     res.status(400).json({ error: 'Missing url parameter' });
@@ -253,28 +275,44 @@ router.get('/subdownload', async (req, res) => {
       return;
     }
 
-    // Forward content type
-    const contentType = response.headers.get('content-type');
-    if (contentType) {
-      res.setHeader('Content-Type', contentType);
-    }
+    // Set correct Content-Type based on file extension
+    const ext = (req.params.ext || 'srt').toLowerCase();
+    const mimeMap: Record<string, string> = {
+      srt: 'text/plain; charset=utf-8',
+      vtt: 'text/vtt; charset=utf-8',
+      ass: 'text/x-ssa; charset=utf-8',
+      ssa: 'text/x-ssa; charset=utf-8',
+    };
+    res.setHeader('Content-Type', mimeMap[ext] || 'text/plain; charset=utf-8');
     res.setHeader('Access-Control-Allow-Origin', '*');
 
-    // Stream the response body
+    // Read content, strip BOM if present, then send
     if (response.body) {
+      const chunks: Uint8Array[] = [];
       const reader = response.body.getReader();
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        res.write(value);
+        chunks.push(value);
       }
+      const buffer = Buffer.concat(chunks);
+      // Strip UTF-8 BOM (0xEF 0xBB 0xBF) if present
+      const content = (ext === 'srt' || ext === 'vtt')
+        ? buffer.toString('utf-8').replace(/^\uFEFF/, '')
+        : buffer.toString('utf-8');
+      res.send(content);
+    } else {
+      res.end();
     }
-    res.end();
   } catch (err: any) {
     console.error('[subdownload] Error:', err.message);
     res.status(502).json({ error: 'Failed to fetch subtitle', detail: err.message });
   }
-});
+}
+
+// Both routes: /subdownload.srt and /subdownload (backward compat)
+router.get('/subdownload.:ext', handleSubDownload);
+router.get('/subdownload', handleSubDownload);
 
 // ── Serialization helpers ──────────────────────────────────────────
 function reSerialize(
