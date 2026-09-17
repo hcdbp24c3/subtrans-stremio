@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { decodeConfig, AddonConfig } from '../config.js';
+import { decodeConfig, encodeConfig, AddonConfig } from '../config.js';
 import { fetchJson, fetchText } from '../lib/proxy.js';
 import { detectFormat, parseSubtitle } from '../lib/subtitle-parser.js';
 import { getVideoDuration, calculateOffset, adjustEntries } from '../lib/aligner.js';
@@ -161,7 +161,16 @@ router.get('/subtitles/:type/:id', async (req, res) => {
   allSubs = filterByLanguage(allSubs, config.languages);
   allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
 
-  // 5. Align subtitles if we have video duration
+  // 5. Rewrite subtitle URLs to go through our download proxy
+  //    (upstream addons like SubSense return 127.0.0.1 URLs that only work locally)
+  const base = `${req.protocol}://${req.headers.host || 'localhost'}`;
+  const configParam = encodeURIComponent(encodeConfig(config));
+  allSubs = allSubs.map((sub) => ({
+    ...sub,
+    url: `${base}/subdownload?url=${encodeURIComponent(sub.url)}&config=${configParam}`,
+  }));
+
+  // 6. Align subtitles if we have video duration
   const alignedSubtitles: Subtitle[] = [];
   for (const sub of allSubs) {
     const format = detectFormat(sub.url);
@@ -203,6 +212,68 @@ router.get('/subtitles/:type/:id', async (req, res) => {
   setCache(key, result);
 
   res.json(result);
+});
+
+// ── Subtitle download proxy ───────────────────────────────────────
+// Upstream addons (SubSense) return 127.0.0.1 URLs that only work locally.
+// This endpoint proxies the download so Nuvio/browser can fetch it.
+router.get('/subdownload', async (req, res) => {
+  const url = req.query.url as string;
+  if (!url) {
+    res.status(400).json({ error: 'Missing url parameter' });
+    return;
+  }
+
+  try {
+    let realUrl = decodeURIComponent(url);
+
+    // SubSense wraps download URLs through its local proxy:
+    //   http://127.0.0.1:11470/subtitles.srt?from=https://real-url...
+    // Extract the actual download URL from the 'from' parameter
+    try {
+      const parsed = new URL(realUrl);
+      const from = parsed.searchParams.get('from');
+      if (from && (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost')) {
+        realUrl = from;
+      }
+    } catch {}
+
+    console.log('[subdownload] Proxying:', realUrl.substring(0, 120));
+    const response = await fetch(realUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36',
+        'Referer': 'https://web.stremio.com/',
+        'Accept': '*/*',
+      },
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (!response.ok) {
+      res.status(response.status).json({ error: `Upstream returned ${response.status}` });
+      return;
+    }
+
+    // Forward content type
+    const contentType = response.headers.get('content-type');
+    if (contentType) {
+      res.setHeader('Content-Type', contentType);
+    }
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    // Stream the response body
+    if (response.body) {
+      const reader = response.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(value);
+      }
+    }
+    res.end();
+  } catch (err: any) {
+    console.error('[subdownload] Error:', err.message);
+    res.status(502).json({ error: 'Failed to fetch subtitle', detail: err.message });
+  }
 });
 
 // ── Serialization helpers ──────────────────────────────────────────
