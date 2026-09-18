@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { decodeConfig, encodeConfig, AddonConfig } from '../config.js';
 import { fetchJson, fetchText } from '../lib/proxy.js';
 import { detectFormat, parseSubtitle, SubtitleFormat } from '../lib/subtitle-parser.js';
-import { calculateOffsetFromReference, calculateOffsetFromDuration, getVideoDuration, adjustEntries } from '../lib/aligner.js';
+import { calculateOffsetFromReference, getVideoDuration, detectDialogueStart, calculateOffsetFromDialogue, adjustEntries } from '../lib/aligner.js';
 
 const router = Router();
 
@@ -155,6 +155,7 @@ router.get('/subtitles/:type/*', async (req, res) => {
 
   // 2. Fetch stream to get video URL for alignment (use first stream addon)
   let videoDuration: number | null = null;
+  let videoUrl: string | null = null;
   let refSubs: Subtitle[] = [];
 
   if (config.streamUrls.length > 0) {
@@ -165,15 +166,19 @@ router.get('/subtitles/:type/*', async (req, res) => {
       try {
         const upstreamStreamUrl = `${streamBaseUrl}/stream/${type}/${decodedId}`;
         const streamResponse = await fetchJson<{ streams: Array<{ url?: string }> }>(upstreamStreamUrl);
-        const videoUrl = streamResponse?.streams?.[0]?.url;
+        videoUrl = streamResponse?.streams?.[0]?.url ?? null;
         if (videoUrl) {
           videoDuration = await getVideoDuration(videoUrl);
           if (videoDuration) {
             console.log(`[subtitle] Video duration: ${videoDuration.toFixed(1)}s`);
+          } else {
+            console.log(`[subtitle] Could not get video duration`);
           }
+        } else {
+          console.log(`[subtitle] No video URL in stream response`);
         }
-      } catch {
-        // Stream fetch failed — proceed without duration
+      } catch (e: any) {
+        console.log(`[subtitle] Stream fetch failed: ${e.message}`);
       }
 
       // Also try to get reference subtitles from stream addon
@@ -181,6 +186,7 @@ router.get('/subtitles/:type/*', async (req, res) => {
         const upstreamSubUrl = `${streamBaseUrl}/subtitles/${type}/${decodedId}.json`;
         const data = await fetchJson<{ subtitles: Subtitle[] }>(upstreamSubUrl);
         refSubs = data?.subtitles || [];
+        console.log(`[subtitle] Reference subs from stream addon: ${refSubs.length}`);
       } catch {
         // Stream addon doesn't support subtitles resource
       }
@@ -222,7 +228,7 @@ router.get('/subtitles/:type/*', async (req, res) => {
   //    Downloads use ORIGINAL upstream URLs (before proxy rewrite)
   let offset = 0;
 
-  // Strategy A: Reference subtitle comparison
+  // Strategy A: Reference subtitle comparison (highest confidence)
   if (refSubs.length > 0 && allSubs.length > 0) {
     const refByLang = new Map<string, Subtitle[]>();
     for (const s of refSubs) {
@@ -267,25 +273,78 @@ router.get('/subtitles/:type/*', async (req, res) => {
     if (offsets.length > 0) {
       offsets.sort((a, b) => a - b);
       offset = offsets[Math.floor(offsets.length / 2)];
+      console.log(`[subtitle] Strategy A (reference): offset=${offset.toFixed(1)}s from ${offsets.length} pairs`);
+    } else {
+      console.log(`[subtitle] Strategy A (reference): no offset found (${refSubs.length} ref subs, ${allSubs.length} our subs)`);
     }
   }
 
-  // Strategy B: Duration-based alignment (if no reference offset found)
-  if (offset === 0 && videoDuration && videoDuration > 0) {
-    for (const sub of allSubs.slice(0, 3)) {
-      const format = sub._format || 'srt' as SubtitleFormat;
+  // Strategy B: Cross-correlation between multiple subtitle files
+  // Compare the first few subtitle files against each other to detect offset
+  // (works when different uploaders/source versions have different timing)
+  if (offset === 0 && allSubs.length >= 2) {
+    console.log(`[subtitle] Strategy B (cross-correlation): comparing ${allSubs.length} subtitle files...`);
+    const crossOffsets: number[] = [];
+
+    for (let i = 0; i < Math.min(allSubs.length, 3); i++) {
+      for (let j = i + 1; j < Math.min(allSubs.length, 3); j++) {
+        const fmtA = allSubs[i]._format || 'srt' as SubtitleFormat;
+        const fmtB = allSubs[j]._format || 'srt' as SubtitleFormat;
+        const realUrlA = resolveRealUrl(allSubs[i].url);
+        const realUrlB = resolveRealUrl(allSubs[j].url);
+
+        const [contentA, contentB] = await Promise.all([fetchText(realUrlA), fetchText(realUrlB)]);
+        if (!contentA || !contentB) continue;
+
+        const entriesA = parseSubtitle(contentA, fmtA);
+        const entriesB = parseSubtitle(contentB, fmtB);
+        if (entriesA.length === 0 || entriesB.length === 0) continue;
+
+        const pairOffset = calculateOffsetFromReference(entriesA, entriesB);
+        if (pairOffset !== 0) {
+          crossOffsets.push(pairOffset);
+          console.log(`[subtitle]   Cross-correlation: file ${i} vs ${j} → ${pairOffset.toFixed(1)}s`);
+        }
+      }
+    }
+
+    if (crossOffsets.length > 0) {
+      crossOffsets.sort((a, b) => a - b);
+      offset = crossOffsets[Math.floor(crossOffsets.length / 2)];
+      console.log(`[subtitle] Strategy B (cross-correlation): offset=${offset.toFixed(1)}s from ${crossOffsets.length} pairs`);
+    } else {
+      console.log(`[subtitle] Strategy B (cross-correlation): files agree (no offset detected)`);
+    }
+  }
+
+  // Strategy C: Audio-based dialogue start detection (slower, last resort)
+  // Uses ffmpeg silencedetect to find when dialogue actually starts in the video,
+  // then compares with the first subtitle entry
+  if (offset === 0 && videoUrl) {
+    console.log(`[subtitle] Strategy C (audio dialogue detection): analyzing...`);
+    const dialogueStart = detectDialogueStart(videoUrl);
+    if (dialogueStart !== null) {
+      // Download one subtitle to compare
+      const sub = allSubs[0];
+      const fmt = sub._format || 'srt' as SubtitleFormat;
       const realUrl = resolveRealUrl(sub.url);
       const content = await fetchText(realUrl);
-      if (!content) continue;
-      const entries = parseSubtitle(content, format);
-      if (entries.length === 0) continue;
-
-      offset = calculateOffsetFromDuration(entries, videoDuration);
-      if (offset !== 0) break;
+      if (content) {
+        const entries = parseSubtitle(content, fmt);
+        if (entries.length > 0) {
+          const dialogueOffset = calculateOffsetFromDialogue(entries, dialogueStart);
+          if (dialogueOffset !== 0) {
+            offset = dialogueOffset;
+            console.log(`[subtitle] Strategy C (dialogue): offset=${offset.toFixed(1)}s`);
+          }
+        }
+      }
+    } else {
+      console.log(`[subtitle] Strategy C (dialogue): detection failed`);
     }
   }
 
-  console.log(`[subtitle] Alignment: offset=${offset.toFixed(1)}s, duration=${videoDuration?.toFixed(0) ?? 'none'}s, subs=${allSubs.length}`);
+  console.log(`[subtitle] Final: offset=${offset.toFixed(1)}s, duration=${videoDuration?.toFixed(0) ?? 'none'}s, subs=${allSubs.length}`);
 
   // 7. If offset detected, re-download all subs and re-serialize with offset applied
   //    (using resolved upstream URLs for download)

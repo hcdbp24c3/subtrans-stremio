@@ -98,36 +98,115 @@ export function calculateOffsetFromReference(
   return median;
 }
 
-// ── Offset from video duration ─────────────────────────────────────
+// ── Audio-based dialogue start detection ───────────────────────────
 
 /**
- * Calculate offset by comparing subtitle time range with video duration.
+ * Detect when the first dialogue starts in the video using ffmpeg silence detection.
  *
- * Uses the LAST subtitle entry's timestamp vs video duration to detect
- * systematic offset. If the last sub ends much earlier than the video,
- * the subs may be shifted early (positive offset needed).
+ * Uses ffmpeg's silencedetect filter on the first 3 minutes of audio to find
+ * when actual audio content (dialogue) begins. Skips initial silence (studio logos)
+ * and returns the timestamp of the first significant audio segment.
+ *
+ * This is more reliable than duration-based alignment because it directly
+ * measures when audio content starts, rather than comparing end timestamps
+ * (which are unreliable due to credits gaps).
+ *
+ * @returns timestamp in seconds when first dialogue starts, or null if detection fails
  */
-export function calculateOffsetFromDuration(
+export function detectDialogueStart(videoUrl: string): number | null {
+  try {
+    // Step 1: Use curl to follow redirects and get the final CDN URL
+    let probeUrl = videoUrl;
+    const location = execSync(
+      `curl -sI --max-time 10 "${videoUrl}" 2>/dev/null | grep -i "^location:" | tail -1 | tr -d '\\r' | awk '{print $2}'`,
+      { encoding: 'utf-8', timeout: 15000 },
+    ).trim();
+
+    if (location) {
+      probeUrl = location;
+    }
+
+    // Step 2: Extract first 3 minutes of audio and detect silence boundaries
+    // -35dB threshold: below this is considered silence (avoids background noise)
+    // 1.0s minimum duration: brief pauses between words aren't silence
+    const result = execSync(
+      `ffmpeg -i "${probeUrl}" -t 180 -af silencedetect=n=-35dB:d=1.0 -f null - 2>&1 | ` +
+      `grep "silence_end" | head -5`,
+      { encoding: 'utf-8', timeout: 60000 },
+    ).trim();
+
+    if (!result) return null;
+
+    // Parse silence_end timestamps: "silence_end: 31.5 | silence_duration: 15.2"
+    const ends: number[] = [];
+    for (const line of result.split('\n')) {
+      const match = line.match(/silence_end:\s*([\d.]+)/);
+      if (match) {
+        ends.push(parseFloat(match[1]));
+      }
+    }
+
+    if (ends.length === 0) return null;
+
+    // The first silence_end is when the first audio content starts
+    // Skip very early detections (< 3s) which are likely studio logo sounds
+    const firstDialogue = ends.find((t) => t >= 3.0) ?? ends[0];
+
+    console.log(
+      `[aligner] Dialogue start detected at ${firstDialogue.toFixed(1)}s ` +
+      `(${ends.length} audio segments found in first 3 minutes)`
+    );
+
+    return firstDialogue;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Calculate offset by detecting when dialogue starts in the video
+ * and comparing with the first subtitle entry.
+ *
+ * If the first subtitle starts at 31s but dialogue starts at 60s,
+ * the subs are 29s early → offset = +29s (shift subs forward).
+ */
+export function calculateOffsetFromDialogue(
   entries: SubtitleEntry[],
-  videoDuration: number,
+  dialogueStart: number,
 ): number {
-  if (entries.length === 0 || videoDuration <= 0) return 0;
+  if (entries.length === 0 || dialogueStart <= 0) return 0;
 
-  // Use the last entry's end time vs video duration
-  const maxEnd = Math.max(...entries.map((e) => e.end));
-  const minStart = Math.min(...entries.map((e) => e.start));
+  // Use the first few subtitle entries to estimate when dialogue "should" start
+  // Sort by start time and take the earliest entries
+  const sorted = [...entries].sort((a, b) => a.start - b.start);
+  const firstSubStart = sorted[0].start;
 
-  // The offset is the difference between video end and sub end
-  // This detects if subs end before the video does (shift forward)
-  // or after (shift backward)
-  const rawOffset = videoDuration - maxEnd;
+  // The offset is: when dialogue actually starts - when first subtitle says it starts
+  // Positive = subs are early (need to shift forward)
+  // Negative = subs are late (need to shift backward)
+  const rawOffset = dialogueStart - firstSubStart;
 
   if (Math.abs(rawOffset) < OFFSET_THRESHOLD) return 0;
   if (Math.abs(rawOffset) > MAX_OFFSET) return 0;
 
+  // Confidence check: also verify with 2nd and 3rd entries if available
+  if (sorted.length >= 3) {
+    const offsets = [
+      dialogueStart - sorted[0].start,
+      dialogueStart - sorted[1].start + (sorted[1].start - sorted[0].start),
+    ];
+    // If the offsets diverge significantly, confidence is low
+    if (Math.abs(offsets[0] - offsets[1]) > 5.0) {
+      console.log(
+        `[aligner] Dialogue offset inconsistent (${offsets[0].toFixed(1)}s vs ${offsets[1].toFixed(1)}s), skipping`
+      );
+      return 0;
+    }
+  }
+
   console.log(
-    `[aligner] Duration offset: ${rawOffset.toFixed(1)}s ` +
-    `(sub ends at ${maxEnd.toFixed(0)}s, video ${videoDuration.toFixed(0)}s)`
+    `[aligner] Dialogue offset: ${rawOffset.toFixed(1)}s ` +
+    `(dialogue at ${dialogueStart.toFixed(1)}s, first sub at ${firstSubStart.toFixed(1)}s)`
   );
 
   return rawOffset;
