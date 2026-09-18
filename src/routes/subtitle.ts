@@ -122,7 +122,10 @@ function limitPerLanguage(subs: Subtitle[], limit: number): Subtitle[] {
 }
 
 // ── Route ──────────────────────────────────────────────────────────
-router.get('/subtitles/:type/:id', async (req, res) => {
+// Stremio appends extra path segments to subtitle URLs:
+//   /subtitles/movie/tt27681354/filename=...mkv&videoSize=...json
+// Use wildcard to capture the full path after /subtitles/:type/
+router.get('/subtitles/:type/*', async (req, res) => {
   const configStr = req.query.config as string;
   if (!configStr) {
     res.status(400).json({ error: 'Missing config' });
@@ -135,10 +138,12 @@ router.get('/subtitles/:type/:id', async (req, res) => {
     return;
   }
 
-  const { type, id } = req.params;
-  // Stremio appends .json to resource URLs (/subtitles/movie/tt123.json)
-  // Strip it so we get the raw IMDb ID for upstream queries
-  const decodedId = decodeURIComponent(id).replace(/\.json$/, '');
+  const { type } = req.params;
+  // Wildcard captures everything after /subtitles/:type/
+  // e.g. "tt27681354/filename=...mkv&videoSize=...json"
+  const wildcard = (req.params as any)[0] || '';
+  const rawId = wildcard.split('/')[0];
+  const decodedId = decodeURIComponent(rawId).replace(/\.json$/, '');
 
   // 1. Check cache
   const key = cacheKey(config, type, decodedId);
