@@ -124,18 +124,21 @@ export function detectDialogueStart(videoUrl: string): number | null {
 
     if (location) {
       probeUrl = location;
+      console.log(`[aligner] Resolved URL: ${probeUrl.substring(0, 120)}...`);
     }
 
     // Step 2: Extract first 3 minutes of audio and detect silence boundaries
     // -35dB threshold: below this is considered silence (avoids background noise)
     // 1.0s minimum duration: brief pauses between words aren't silence
-    const result = execSync(
-      `ffmpeg -i "${probeUrl}" -t 180 -af silencedetect=n=-35dB:d=1.0 -f null - 2>&1 | ` +
-      `grep "silence_end" | head -5`,
-      { encoding: 'utf-8', timeout: 60000 },
-    ).trim();
+    const ffmpegCmd = `ffmpeg -i "${probeUrl}" -t 180 -af silencedetect=n=-35dB:d=1.0 -f null - 2>&1 | grep "silence_end" | head -5`;
+    console.log(`[aligner] Running ffmpeg silencedetect...`);
 
-    if (!result) return null;
+    const result = execSync(ffmpegCmd, { encoding: 'utf-8', timeout: 120000 }).trim();
+
+    if (!result) {
+      console.log(`[aligner] ffmpeg returned no silence_end lines`);
+      return null;
+    }
 
     // Parse silence_end timestamps: "silence_end: 31.5 | silence_duration: 15.2"
     const ends: number[] = [];
@@ -146,7 +149,10 @@ export function detectDialogueStart(videoUrl: string): number | null {
       }
     }
 
-    if (ends.length === 0) return null;
+    if (ends.length === 0) {
+      console.log(`[aligner] No silence_end timestamps parsed from ffmpeg output`);
+      return null;
+    }
 
     // The first silence_end is when the first audio content starts
     // Skip very early detections (< 3s) which are likely studio logo sounds
@@ -158,7 +164,8 @@ export function detectDialogueStart(videoUrl: string): number | null {
     );
 
     return firstDialogue;
-  } catch {
+  } catch (e: any) {
+    console.log(`[aligner] Dialogue detection failed: ${e.message?.substring(0, 200)}`);
     return null;
   }
 }
