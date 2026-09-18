@@ -406,11 +406,24 @@ async function handleSubDownload(req: any, res: any) {
         chunks.push(value);
       }
       const buffer = Buffer.concat(chunks);
-      // Strip UTF-8 BOM (0xEF 0xBB 0xBF) if present
-      const content = (ext === 'srt' || ext === 'vtt')
-        ? buffer.toString('utf-8').replace(/^\uFEFF/, '')
-        : buffer.toString('utf-8');
-      res.send(content);
+      const rawContent = buffer.toString('utf-8').replace(/^\uFEFF/, '');
+
+      // Stremio only supports SRT/VTT — convert ASS/SSA to SRT on the fly
+      const upstreamFormat = detectFormat(url) || ((ext === 'ass' || ext === 'ssa') ? 'ass' : null);
+      if (upstreamFormat === 'ass') {
+        const entries = parseSubtitle(rawContent, 'ass');
+        if (entries.length > 0) {
+          const srtContent = reSerialize(entries, 'srt');
+          if (srtContent) {
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.send(srtContent);
+            return;
+          }
+        }
+      }
+
+      // SRT/VTT: send as-is
+      res.send(rawContent);
     } else {
       res.end();
     }
