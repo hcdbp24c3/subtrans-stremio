@@ -14,6 +14,7 @@ interface Subtitle {
   url: string;
   lang?: string;
   _format?: SubtitleFormat;
+  _source?: number; // index of the sub addon that provided this subtitle
 }
 
 interface Manifest {
@@ -156,58 +157,44 @@ router.get('/subtitles/:type/*', async (req, res) => {
   // 2. Fetch stream to get video URL for alignment (use first stream addon)
   let videoDuration: number | null = null;
   let videoUrl: string | null = null;
-  let refSubs: Subtitle[] = [];
 
   if (config.streamUrls.length > 0) {
     try {
       const streamBaseUrl = await getUpstreamBaseUrl(config.streamUrls[0]);
-
-      // Try to get video URL for ffprobe-based alignment
-      try {
-        const upstreamStreamUrl = `${streamBaseUrl}/stream/${type}/${decodedId}`;
-        const streamResponse = await fetchJson<{ streams: Array<{ url?: string }> }>(upstreamStreamUrl);
-        videoUrl = streamResponse?.streams?.[0]?.url ?? null;
-        if (videoUrl) {
-          videoDuration = await getVideoDuration(videoUrl);
-          if (videoDuration) {
-            console.log(`[subtitle] Video duration: ${videoDuration.toFixed(1)}s`);
-          } else {
-            console.log(`[subtitle] Could not get video duration`);
-          }
-        } else {
-          console.log(`[subtitle] No video URL in stream response`);
-        }
-      } catch (e: any) {
-        console.log(`[subtitle] Stream fetch failed: ${e.message}`);
+      const upstreamStreamUrl = `${streamBaseUrl}/stream/${type}/${decodedId}`;
+      const streamResponse = await fetchJson<{ streams: Array<{ url?: string }> }>(upstreamStreamUrl);
+      videoUrl = streamResponse?.streams?.[0]?.url ?? null;
+      if (videoUrl) {
+        videoDuration = await getVideoDuration(videoUrl);
+        console.log(`[subtitle] Video URL obtained, duration: ${videoDuration?.toFixed(1) ?? 'unknown'}s`);
+      } else {
+        console.log(`[subtitle] No video URL in stream response`);
       }
-
-      // Also try to get reference subtitles from stream addon
-      try {
-        const upstreamSubUrl = `${streamBaseUrl}/subtitles/${type}/${decodedId}.json`;
-        const data = await fetchJson<{ subtitles: Subtitle[] }>(upstreamSubUrl);
-        refSubs = data?.subtitles || [];
-        console.log(`[subtitle] Reference subs from stream addon: ${refSubs.length}`);
-      } catch {
-        // Stream addon doesn't support subtitles resource
-      }
-    } catch {
-      // Stream addon manifest fetch failed
+    } catch (e: any) {
+      console.log(`[subtitle] Stream fetch failed: ${e.message}`);
     }
   }
 
   // 3. Fetch subtitles from ALL upstream sub addons in parallel
+  //    Track which addon provided each subtitle for cross-correlation
   const subResults = await Promise.allSettled(
-    config.subUrls.map(async (subUrl) => {
+    config.subUrls.map(async (subUrl, sourceIdx) => {
       const subBaseUrl = await getUpstreamBaseUrl(subUrl);
       const upstreamSubUrl = `${subBaseUrl}/subtitles/${type}/${decodedId}.json`;
       const data = await fetchJson<{ subtitles: Subtitle[] }>(upstreamSubUrl);
-      return data?.subtitles || [];
+      const subs = data?.subtitles || [];
+      // Tag each subtitle with its source addon index
+      return subs.map((s) => ({ ...s, _source: sourceIdx }));
     })
   );
 
-  let allSubs = subResults
-    .filter((r): r is PromiseFulfilledResult<Subtitle[]> => r.status === 'fulfilled')
+  const settledSubs = subResults
+    .filter((r): r is PromiseFulfilledResult<Array<Subtitle & { _source: number }>> => r.status === 'fulfilled')
     .flatMap((r) => r.value);
+
+  let allSubs: Subtitle[] = settledSubs;
+
+  console.log(`[subtitle] Fetched ${allSubs.length} subs from ${config.subUrls.length} addon(s)`);
 
   if (allSubs.length === 0) {
     res.json({ subtitles: [] });
@@ -228,82 +215,64 @@ router.get('/subtitles/:type/*', async (req, res) => {
   //    Downloads use ORIGINAL upstream URLs (before proxy rewrite)
   let offset = 0;
 
-  // Strategy A: Reference subtitle comparison (highest confidence)
-  if (refSubs.length > 0 && allSubs.length > 0) {
-    const refByLang = new Map<string, Subtitle[]>();
-    for (const s of refSubs) {
-      const lang = normalizeLang(s.lang || '');
-      if (!refByLang.has(lang)) refByLang.set(lang, []);
-      refByLang.get(lang)!.push(s);
-    }
-    const ourByLang = new Map<string, Subtitle[]>();
-    for (const s of allSubs) {
-      const lang = normalizeLang(s.lang || '');
-      if (!ourByLang.has(lang)) ourByLang.set(lang, []);
-      ourByLang.get(lang)!.push(s);
-    }
-
-    const offsets: number[] = [];
-    for (const [lang, refLangSubs] of refByLang) {
-      const ourLangSubs = ourByLang.get(lang);
-      if (!ourLangSubs || ourLangSubs.length === 0) continue;
-
-      for (const refSub of refLangSubs.slice(0, 2)) {
-        const refFormat = detectFormat(refSub.url);
-        if (!refFormat) continue;
-        const refContent = await fetchText(refSub.url);
-        if (!refContent) continue;
-        const refEntries = parseSubtitle(refContent, refFormat);
-        if (refEntries.length === 0) continue;
-
-        for (const ourSub of ourLangSubs.slice(0, 2)) {
-          const ourFormat = ourSub._format || 'srt' as SubtitleFormat;
-          const ourRealUrl = resolveRealUrl(ourSub.url);
-          const ourContent = await fetchText(ourRealUrl);
-          if (!ourContent) continue;
-          const ourEntries = parseSubtitle(ourContent, ourFormat);
-          if (ourEntries.length === 0) continue;
-
-          const pairOffset = calculateOffsetFromReference(refEntries, ourEntries);
-          if (pairOffset !== 0) offsets.push(pairOffset);
-        }
-      }
-    }
-
-    if (offsets.length > 0) {
-      offsets.sort((a, b) => a - b);
-      offset = offsets[Math.floor(offsets.length / 2)];
-      console.log(`[subtitle] Strategy A (reference): offset=${offset.toFixed(1)}s from ${offsets.length} pairs`);
-    } else {
-      console.log(`[subtitle] Strategy A (reference): no offset found (${refSubs.length} ref subs, ${allSubs.length} our subs)`);
-    }
+  // ── Strategy A: Cross-correlation between DIFFERENT sub addons ──────
+  // Compare subs from different addons against each other.
+  // Different addons may use different sources/uploaders with different timing.
+  // If they disagree on when a line appears, the difference is the offset.
+  const sourceGroups = new Map<number, Subtitle[]>();
+  for (const s of allSubs) {
+    const src = s._source ?? -1;
+    if (!sourceGroups.has(src)) sourceGroups.set(src, []);
+    sourceGroups.get(src)!.push(s);
   }
+  const sourceIndices = [...sourceGroups.keys()].filter((k) => k >= 0);
 
-  // Strategy B: Cross-correlation between multiple subtitle files
-  // Compare the first few subtitle files against each other to detect offset
-  // (works when different uploaders/source versions have different timing)
-  if (offset === 0 && allSubs.length >= 2) {
-    console.log(`[subtitle] Strategy B (cross-correlation): comparing ${allSubs.length} subtitle files...`);
+  if (sourceIndices.length >= 2) {
+    console.log(`[subtitle] Strategy A (cross-addon): comparing ${sourceIndices.length} addon sources...`);
     const crossOffsets: number[] = [];
 
-    for (let i = 0; i < Math.min(allSubs.length, 3); i++) {
-      for (let j = i + 1; j < Math.min(allSubs.length, 3); j++) {
-        const fmtA = allSubs[i]._format || 'srt' as SubtitleFormat;
-        const fmtB = allSubs[j]._format || 'srt' as SubtitleFormat;
-        const realUrlA = resolveRealUrl(allSubs[i].url);
-        const realUrlB = resolveRealUrl(allSubs[j].url);
+    // For each pair of addons, download one sub per language and compare
+    for (let i = 0; i < sourceIndices.length; i++) {
+      for (let j = i + 1; j < sourceIndices.length; j++) {
+        const subsA = sourceGroups.get(sourceIndices[i])!;
+        const subsB = sourceGroups.get(sourceIndices[j])!;
 
-        const [contentA, contentB] = await Promise.all([fetchText(realUrlA), fetchText(realUrlB)]);
-        if (!contentA || !contentB) continue;
+        // Group each addon's subs by language
+        const byLangA = new Map<string, Subtitle[]>();
+        for (const s of subsA) {
+          const lang = normalizeLang(s.lang || '');
+          if (!byLangA.has(lang)) byLangA.set(lang, []);
+          byLangA.get(lang)!.push(s);
+        }
+        const byLangB = new Map<string, Subtitle[]>();
+        for (const s of subsB) {
+          const lang = normalizeLang(s.lang || '');
+          if (!byLangB.has(lang)) byLangB.set(lang, []);
+          byLangB.get(lang)!.push(s);
+        }
 
-        const entriesA = parseSubtitle(contentA, fmtA);
-        const entriesB = parseSubtitle(contentB, fmtB);
-        if (entriesA.length === 0 || entriesB.length === 0) continue;
+        // For each common language, compare the first sub from each addon
+        for (const [lang, langSubsA] of byLangA) {
+          const langSubsB = byLangB.get(lang);
+          if (!langSubsB || langSubsB.length === 0) continue;
 
-        const pairOffset = calculateOffsetFromReference(entriesA, entriesB);
-        if (pairOffset !== 0) {
-          crossOffsets.push(pairOffset);
-          console.log(`[subtitle]   Cross-correlation: file ${i} vs ${j} → ${pairOffset.toFixed(1)}s`);
+          const fmtA = langSubsA[0]._format || 'srt' as SubtitleFormat;
+          const fmtB = langSubsB[0]._format || 'srt' as SubtitleFormat;
+          const realUrlA = resolveRealUrl(langSubsA[0].url);
+          const realUrlB = resolveRealUrl(langSubsB[0].url);
+
+          const [contentA, contentB] = await Promise.all([fetchText(realUrlA), fetchText(realUrlB)]);
+          if (!contentA || !contentB) continue;
+
+          const entriesA = parseSubtitle(contentA, fmtA);
+          const entriesB = parseSubtitle(contentB, fmtB);
+          if (entriesA.length === 0 || entriesB.length === 0) continue;
+
+          const pairOffset = calculateOffsetFromReference(entriesA, entriesB);
+          if (pairOffset !== 0) {
+            crossOffsets.push(pairOffset);
+            console.log(`[subtitle]   Addon ${sourceIndices[i]} vs ${sourceIndices[j]} [${lang}]: ${pairOffset.toFixed(1)}s`);
+          }
         }
       }
     }
@@ -311,20 +280,63 @@ router.get('/subtitles/:type/*', async (req, res) => {
     if (crossOffsets.length > 0) {
       crossOffsets.sort((a, b) => a - b);
       offset = crossOffsets[Math.floor(crossOffsets.length / 2)];
-      console.log(`[subtitle] Strategy B (cross-correlation): offset=${offset.toFixed(1)}s from ${crossOffsets.length} pairs`);
+      console.log(`[subtitle] Strategy A (cross-addon): offset=${offset.toFixed(1)}s from ${crossOffsets.length} pairs`);
     } else {
-      console.log(`[subtitle] Strategy B (cross-correlation): files agree (no offset detected)`);
+      console.log(`[subtitle] Strategy A (cross-addon): addons agree (no offset detected)`);
+    }
+  } else {
+    console.log(`[subtitle] Strategy A (cross-addon): skipped (need ≥2 addon sources, have ${sourceIndices.length})`);
+  }
+
+  // ── Strategy B: Cross-correlation within same addon (multiple files) ──
+  // Some addons return multiple subtitle files (SSA + SRT from different uploaders).
+  // Compare files from the same addon against each other.
+  if (offset === 0) {
+    console.log(`[subtitle] Strategy B (cross-file): comparing files within addons...`);
+    const crossOffsets: number[] = [];
+
+    for (const [src, srcSubs] of sourceGroups) {
+      if (src < 0 || srcSubs.length < 2) continue;
+
+      for (let i = 0; i < Math.min(srcSubs.length, 3); i++) {
+        for (let j = i + 1; j < Math.min(srcSubs.length, 3); j++) {
+          const fmtA = srcSubs[i]._format || 'srt' as SubtitleFormat;
+          const fmtB = srcSubs[j]._format || 'srt' as SubtitleFormat;
+          const realUrlA = resolveRealUrl(srcSubs[i].url);
+          const realUrlB = resolveRealUrl(srcSubs[j].url);
+
+          const [contentA, contentB] = await Promise.all([fetchText(realUrlA), fetchText(realUrlB)]);
+          if (!contentA || !contentB) continue;
+
+          const entriesA = parseSubtitle(contentA, fmtA);
+          const entriesB = parseSubtitle(contentB, fmtB);
+          if (entriesA.length === 0 || entriesB.length === 0) continue;
+
+          const pairOffset = calculateOffsetFromReference(entriesA, entriesB);
+          if (pairOffset !== 0) {
+            crossOffsets.push(pairOffset);
+            console.log(`[subtitle]   Addon ${src}: file ${i} vs ${j} → ${pairOffset.toFixed(1)}s`);
+          }
+        }
+      }
+    }
+
+    if (crossOffsets.length > 0) {
+      crossOffsets.sort((a, b) => a - b);
+      offset = crossOffsets[Math.floor(crossOffsets.length / 2)];
+      console.log(`[subtitle] Strategy B (cross-file): offset=${offset.toFixed(1)}s from ${crossOffsets.length} pairs`);
+    } else {
+      console.log(`[subtitle] Strategy B (cross-file): files agree (no offset detected)`);
     }
   }
 
-  // Strategy C: Audio-based dialogue start detection (slower, last resort)
+  // ── Strategy C: Audio-based dialogue start detection ─────────────
   // Uses ffmpeg silencedetect to find when dialogue actually starts in the video,
-  // then compares with the first subtitle entry
+  // then compares with the first subtitle entry. Slower but works with single source.
   if (offset === 0 && videoUrl) {
     console.log(`[subtitle] Strategy C (audio dialogue detection): analyzing...`);
     const dialogueStart = detectDialogueStart(videoUrl);
     if (dialogueStart !== null) {
-      // Download one subtitle to compare
       const sub = allSubs[0];
       const fmt = sub._format || 'srt' as SubtitleFormat;
       const realUrl = resolveRealUrl(sub.url);
