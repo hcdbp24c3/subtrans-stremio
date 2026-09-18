@@ -251,7 +251,7 @@ router.get('/subtitles/:type/*', async (req, res) => {
   if (config.streamUrls.length > 0) {
     try {
       const streamBaseUrl = await getUpstreamBaseUrl(config.streamUrls[0]);
-      const upstreamStreamUrl = `${streamBaseUrl}/stream/${type}/${decodedId}`;
+      const upstreamStreamUrl = `${streamBaseUrl}/stream/${type}/${decodedId}.json`;
       const streamResponse = await fetchJson<StreamResponse>(upstreamStreamUrl);
       const bestStream = streamResponse?.streams?.[0];
       if (bestStream) {
