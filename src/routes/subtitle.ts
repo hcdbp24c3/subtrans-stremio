@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { decodeConfig, encodeConfig, AddonConfig } from '../config.js';
 import { fetchJson, fetchText } from '../lib/proxy.js';
 import { detectFormat, parseSubtitle, SubtitleFormat } from '../lib/subtitle-parser.js';
-import { calculateOffsetFromReference, getVideoDuration, extractBuiltinSubtitles, adjustEntries } from '../lib/aligner.js';
+import { calculateOffsetFromReference, getVideoDuration, adjustEntries } from '../lib/aligner.js';
 
 const router = Router();
 
@@ -395,33 +395,22 @@ router.get('/subtitles/:type/*', async (req, res) => {
     }
   }
 
-  // ── Strategy C: Extract built-in subtitle from video (fast & reliable) ──
-  // The video file may contain correctly-timed subtitles (SRT/ASS/PGS).
-  // We extract the text-based subtitle and compare its timing with external subs.
-  // Subtitle tracks are tiny (~KB) so this works even on slow debrid URLs.
-  if (offset === 0 && videoUrl) {
-    console.log(`[subtitle] Strategy C (builtin sub): extracting from video...`);
-    const builtinEntries = extractBuiltinSubtitles(videoUrl);
-    if (builtinEntries && builtinEntries.length > 0) {
-      // Compare the first external sub against the built-in sub
-      const sub = allSubs[0];
-      const fmt = sub._format || 'srt' as SubtitleFormat;
-      const realUrl = resolveRealUrl(sub.url);
-      const content = await fetchText(realUrl);
-      if (content) {
-        const externalEntries = parseSubtitle(content, fmt);
-        if (externalEntries.length > 0) {
-          const builtinOffset = calculateOffsetFromReference(builtinEntries, externalEntries);
-          if (builtinOffset !== 0) {
-            offset = builtinOffset;
-            console.log(`[subtitle] Strategy C (builtin sub): offset=${offset.toFixed(1)}s`);
-          } else {
-            console.log(`[subtitle] Strategy C (builtin sub): subs already in sync`);
-          }
-        }
-      }
-    } else {
-      console.log(`[subtitle] Strategy C (builtin sub): no text subtitle in video`);
+  // ── Auto-sync not possible on debrid URLs ──────────────────────────
+  // Debrid services (real-debrid, etc.) don't support HTTP Range requests,
+  // so we can't extract built-in subs or analyze audio from the video.
+  // When release names don't match, warn the user.
+  if (offset === 0 && videoFilename && allSubs.length > 0) {
+    const bestRelease = allSubs[0]._releaseName || '';
+    const videoNorm = videoFilename.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const releaseNorm = bestRelease.toLowerCase().replace(/[^a-z0-9]/g, '');
+    // Extract encode info (WEB-DL, BluRay, REMUX, etc.)
+    const videoEncodes = videoFilename.match(/(bluray|remux|web-dl|webrip|hdtv|dvdrip)/gi) || [];
+    const subEncodes = bestRelease.match(/(bluray|remux|web-dl|webrip|hdtv|dvdrip)/gi) || [];
+    const encodeMismatch = videoEncodes.length > 0 && subEncodes.length > 0 &&
+      !videoEncodes.some(e => subEncodes.map(se => se.toLowerCase()).includes(e.toLowerCase()));
+    if (encodeMismatch) {
+      console.log(`[subtitle] ⚠ ENCODE MISMATCH: video=${videoEncodes.join(',')} sub=${subEncodes.join(',')}`);
+      console.log(`[subtitle] Subs may be out of sync. Use Stremio's built-in offset to adjust.`);
     }
   }
 
