@@ -1,5 +1,6 @@
 import { execSync } from 'child_process';
-import { SubtitleEntry } from './subtitle-parser.js';
+import { readFileSync, existsSync, unlinkSync } from 'fs';
+import { SubtitleEntry, parseSubtitle, SubtitleFormat } from './subtitle-parser.js';
 
 const OFFSET_THRESHOLD = 0.5; // seconds — ignore offsets smaller than this
 const MAX_OFFSET = 600; // seconds — ignore offsets larger than 10 minutes
@@ -127,22 +128,26 @@ export function detectDialogueStart(videoUrl: string): number | null {
       console.log(`[aligner] Resolved URL: ${probeUrl.substring(0, 120)}...`);
     }
 
-    // Step 2: Extract first 3 minutes of audio and detect silence boundaries
-    // -35dB threshold: below this is considered silence (avoids background noise)
-    // 1.0s minimum duration: brief pauses between words aren't silence
-    const ffmpegCmd = `ffmpeg -i "${probeUrl}" -t 180 -af silencedetect=n=-35dB:d=1.0 -f null - 2>&1 | grep "silence_end" | head -5`;
-    console.log(`[aligner] Running ffmpeg silencedetect...`);
+    // Step 2: Detect silence boundaries using ffmpeg
+    // Use 90s window (not 3min) — faster, less likely to timeout on debrid URLs
+    // -30dB threshold — slightly more aggressive than -35dB to catch quieter dialogue
+    // 1.5s minimum duration — filter out brief pauses
+    const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+    const ffmpegCmd = [
+      `ffmpeg -user_agent "${ua}"`,
+      `-i "${probeUrl}"`,
+      `-t 90`,
+      `-af silencedetect=n=-30dB:d=1.5`,
+      `-f null - 2>&1`,
+    ].join(' ');
+    console.log(`[aligner] Running ffmpeg silencedetect (90s window)...`);
 
-    const result = execSync(ffmpegCmd, { encoding: 'utf-8', timeout: 120000 }).trim();
+    // Capture full output (not just grep) for debugging
+    const fullOutput = execSync(ffmpegCmd, { encoding: 'utf-8', timeout: 90000 }).trim();
 
-    if (!result) {
-      console.log(`[aligner] ffmpeg returned no silence_end lines`);
-      return null;
-    }
-
-    // Parse silence_end timestamps: "silence_end: 31.5 | silence_duration: 15.2"
+    // Parse all silence_end timestamps from full output
     const ends: number[] = [];
-    for (const line of result.split('\n')) {
+    for (const line of fullOutput.split('\n')) {
       const match = line.match(/silence_end:\s*([\d.]+)/);
       if (match) {
         ends.push(parseFloat(match[1]));
@@ -150,7 +155,13 @@ export function detectDialogueStart(videoUrl: string): number | null {
     }
 
     if (ends.length === 0) {
-      console.log(`[aligner] No silence_end timestamps parsed from ffmpeg output`);
+      // Log some of the ffmpeg output for debugging
+      const stderr = fullOutput.split('\n').filter(l => l.includes('Error') || l.includes('error') || l.includes('Invalid') || l.includes('failed'));
+      if (stderr.length > 0) {
+        console.log(`[aligner] ffmpeg errors: ${stderr.slice(0, 3).join(' | ')}`);
+      } else {
+        console.log(`[aligner] No silence_end in ffmpeg output (${fullOutput.split('\n').length} lines total)`);
+      }
       return null;
     }
 
@@ -160,12 +171,12 @@ export function detectDialogueStart(videoUrl: string): number | null {
 
     console.log(
       `[aligner] Dialogue start detected at ${firstDialogue.toFixed(1)}s ` +
-      `(${ends.length} audio segments found in first 3 minutes)`
+      `(${ends.length} audio segments found in first 90s)`
     );
 
     return firstDialogue;
   } catch (e: any) {
-    console.log(`[aligner] Dialogue detection failed: ${e.message?.substring(0, 200)}`);
+    console.log(`[aligner] Dialogue detection failed: ${e.message?.substring(0, 300)}`);
     return null;
   }
 }
@@ -219,7 +230,89 @@ export function calculateOffsetFromDialogue(
   return rawOffset;
 }
 
-// ── Video duration via ffprobe ─────────────────────────────────────
+// ── Built-in subtitle extraction + comparison ─────────────────────
+
+/**
+ * Extract the first text-based subtitle track from a video URL.
+ *
+ * Built-in subs (SRT/ASS embedded in the video) are always correctly synced
+ * because they're part of the same encode. External subs may be for a
+ * different encode with different intro/outro padding.
+ *
+ * This works on debrid URLs because subtitle tracks are tiny (~KB)
+ * — ffmpeg can extract them in seconds even on slow connections.
+ *
+ * @returns parsed subtitle entries, or null if extraction fails
+ */
+export function extractBuiltinSubtitles(videoUrl: string): SubtitleEntry[] | null {
+  try {
+    // Step 1: List subtitle streams in the video
+    const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+    const streamInfo = execSync(
+      `ffprobe -user_agent "${ua}" -v error -show_entries stream=index,codec_name,codec_type -of csv=p=0 "${videoUrl}" 2>/dev/null`,
+      { encoding: 'utf-8', timeout: 30000 },
+    ).trim();
+
+    if (!streamInfo) {
+      console.log(`[aligner] No streams found in video`);
+      return null;
+    }
+
+    // Find text-based subtitle streams
+    const subStreams: { index: number; codec: string }[] = [];
+
+    for (const line of streamInfo.split('\n')) {
+      const parts = line.split(',');
+      if (parts.length >= 3 && parts[2].trim() === 'subtitle') {
+        const codec = parts[1].trim().toLowerCase();
+        // Include all subtitle codecs — ffmpeg will convert to SRT
+        subStreams.push({ index: parseInt(parts[0]), codec });
+      }
+    }
+
+    if (subStreams.length === 0) {
+      console.log(`[aligner] No subtitle streams found in video`);
+      return null;
+    }
+
+    console.log(`[aligner] Found ${subStreams.length} subtitle stream(s): ${subStreams.map(s => `${s.index}:${s.codec}`).join(', ')}`);
+
+    // Step 2: Try each subtitle stream until we get a valid one
+    for (const stream of subStreams) {
+      try {
+        const tmpFile = `/tmp/builtin_sub_${stream.index}_${Date.now()}.srt`;
+
+        execSync(
+          `ffmpeg -user_agent "${ua}" -v error -i "${videoUrl}" -map 0:${stream.index} -c:s srt "${tmpFile}" -y 2>/dev/null`,
+          { encoding: 'utf-8', timeout: 60000 },
+        );
+
+        if (!existsSync(tmpFile)) continue;
+
+        const content = readFileSync(tmpFile, 'utf-8');
+        try { unlinkSync(tmpFile); } catch {}
+
+        if (!content || content.trim().length === 0) continue;
+
+        // Parse as SRT (we converted to SRT)
+        const entries = parseSubtitle(content, 'srt' as SubtitleFormat);
+        if (entries.length > 0) {
+          console.log(`[aligner] Extracted built-in subtitle stream ${stream.index} (${stream.codec}): ${entries.length} entries, ${content.length} chars`);
+          return entries;
+        }
+      } catch {
+        // Try next stream
+        continue;
+      }
+    }
+
+    console.log(`[aligner] Could not extract usable subtitle from any stream`);
+    return null;
+  } catch (e: any) {
+    console.log(`[aligner] Built-in sub extraction failed: ${e.message?.substring(0, 200)}`);
+    return null;
+  }
+}
 
 /**
  * Get video duration by probing the URL.
