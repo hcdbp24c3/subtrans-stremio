@@ -258,55 +258,55 @@ export function extractBuiltinSubtitles(videoUrl: string): SubtitleEntry[] | nul
       return null;
     }
 
-    // Find text-based subtitle streams
+    // Find text-based subtitle streams (skip PGS — bitmap, can't convert to text)
+    const textCodecs = ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'mov_text'];
     const subStreams: { index: number; codec: string }[] = [];
 
     for (const line of streamInfo.split('\n')) {
       const parts = line.split(',');
       if (parts.length >= 3 && parts[2].trim() === 'subtitle') {
         const codec = parts[1].trim().toLowerCase();
-        // Include all subtitle codecs — ffmpeg will convert to SRT
-        subStreams.push({ index: parseInt(parts[0]), codec });
+        if (textCodecs.includes(codec)) {
+          subStreams.push({ index: parseInt(parts[0]), codec });
+        }
       }
     }
 
     if (subStreams.length === 0) {
-      console.log(`[aligner] No subtitle streams found in video`);
+      console.log(`[aligner] No text-based subtitle streams (skipped PGS/bitmap)`);
       return null;
     }
 
-    console.log(`[aligner] Found ${subStreams.length} subtitle stream(s): ${subStreams.map(s => `${s.index}:${s.codec}`).join(', ')}`);
+    console.log(`[aligner] Found ${subStreams.length} text subtitle stream(s): ${subStreams.map(s => `${s.index}:${s.codec}`).join(', ')}`);
 
-    // Step 2: Try each subtitle stream until we get a valid one
-    for (const stream of subStreams) {
-      try {
-        const tmpFile = `/tmp/builtin_sub_${stream.index}_${Date.now()}.srt`;
+    // Step 2: Try ONLY the first text stream — debrid URLs are extremely slow
+    // for MKV seeking (each attempt can take 30-60s+)
+    const stream = subStreams[0];
+    try {
+      const tmpFile = `/tmp/builtin_sub_${stream.index}_${Date.now()}.srt`;
+      console.log(`[aligner] Extracting stream ${stream.index} (${stream.codec})...`);
 
-        execSync(
-          `ffmpeg -user_agent "${ua}" -v error -i "${videoUrl}" -map 0:${stream.index} -c:s srt "${tmpFile}" -y 2>/dev/null`,
-          { encoding: 'utf-8', timeout: 60000 },
-        );
+      // Pipe to stdout via -f srt to avoid file I/O issues
+      const result = execSync(
+        `ffmpeg -user_agent "${ua}" -probesize 32 -analyzeduration 0 -i "${videoUrl}" -map 0:${stream.index} -c:s srt -f srt - 2>/dev/null`,
+        { encoding: 'utf-8', timeout: 30000 },
+      );
 
-        if (!existsSync(tmpFile)) continue;
-
-        const content = readFileSync(tmpFile, 'utf-8');
-        try { unlinkSync(tmpFile); } catch {}
-
-        if (!content || content.trim().length === 0) continue;
-
-        // Parse as SRT (we converted to SRT)
-        const entries = parseSubtitle(content, 'srt' as SubtitleFormat);
+      if (result && result.trim().length > 0) {
+        const entries = parseSubtitle(result, 'srt' as SubtitleFormat);
         if (entries.length > 0) {
-          console.log(`[aligner] Extracted built-in subtitle stream ${stream.index} (${stream.codec}): ${entries.length} entries, ${content.length} chars`);
+          console.log(`[aligner] Extracted built-in subtitle stream ${stream.index}: ${entries.length} entries`);
           return entries;
         }
-      } catch {
-        // Try next stream
-        continue;
+        console.log(`[aligner] Stream ${stream.index}: parsed 0 entries from ${result.length} chars`);
+      } else {
+        console.log(`[aligner] Stream ${stream.index}: empty output`);
       }
+    } catch (e: any) {
+      console.log(`[aligner] Stream ${stream.index} extraction failed: ${e.message?.substring(0, 200)}`);
     }
 
-    console.log(`[aligner] Could not extract usable subtitle from any stream`);
+    console.log(`[aligner] Could not extract usable subtitle from video`);
     return null;
   } catch (e: any) {
     console.log(`[aligner] Built-in sub extraction failed: ${e.message?.substring(0, 200)}`);
