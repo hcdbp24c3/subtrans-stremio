@@ -4,8 +4,9 @@ import { fetchJson, fetchText } from '../lib/proxy.js';
 import { detectFormat, parseSubtitle, SubtitleFormat } from '../lib/subtitle-parser.js';
 import {
   calculateOffsetFromReference, getVideoDuration, adjustEntries,
-  findBestRefSubtitleStream, extractBuiltinSubtitle,
+  extractBuiltinSubtitle,
   calculateOffsetWithFfsubsync, isFfsubsyncAvailable,
+  probeVideoInfo, VideoProbeResult,
 } from '../lib/aligner.js';
 
 const router = Router();
@@ -43,6 +44,26 @@ interface CacheEntry {
 }
 
 const cache = new Map<string, CacheEntry>();
+
+// Separate offset cache: keyed by video URL (reusable across requests)
+const offsetCache = new Map<string, { offset: number; expires: number }>();
+const OFFSET_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+
+function getOffsetFromCache(videoUrl: string): number | null {
+  const entry = offsetCache.get(videoUrl);
+  if (!entry) return null;
+  if (Date.now() > entry.expires) { offsetCache.delete(videoUrl); return null; }
+  console.log(`[subtitle] Using cached offset: ${entry.offset.toFixed(1)}s for this video`);
+  return entry.offset;
+}
+
+function setOffsetCache(videoUrl: string, offset: number): void {
+  if (offsetCache.size > 50) {
+    const oldest = offsetCache.keys().next().value;
+    if (oldest) offsetCache.delete(oldest);
+  }
+  offsetCache.set(videoUrl, { offset, expires: Date.now() + OFFSET_CACHE_TTL });
+}
 
 function cacheKey(config: AddonConfig, type: string, id: string): string {
   return `${config.streamUrls.join(',')}|${config.subUrls.join(',')}|${type}|${id}`;
@@ -322,12 +343,15 @@ router.get('/subtitles/:type/*', async (req, res) => {
     return;
   }
 
-  // 2. Fetch stream to get video URL + filename for alignment (use first stream addon)
+  // 2. Fetch stream + probe video info + fetch subs — ALL IN PARALLEL
   let videoDuration: number | null = null;
   let videoUrl: string | null = null;
   let videoFilename: string | null = null;
+  let videoProbe: VideoProbeResult | null = null;
 
-  if (config.streamUrls.length > 0) {
+  // 2a. Fetch stream info (to get video URL + filename)
+  const streamPromise = (async () => {
+    if (config.streamUrls.length === 0) return;
     try {
       const streamBaseUrl = await getUpstreamBaseUrl(config.streamUrls[0]);
       const upstreamStreamUrl = `${streamBaseUrl}/stream/${type}/${decodedId}.json`;
@@ -336,29 +360,19 @@ router.get('/subtitles/:type/*', async (req, res) => {
       if (bestStream) {
         videoUrl = bestStream.url ?? null;
         videoFilename = bestStream.behaviorHints?.filename ?? bestStream.title ?? null;
-        if (videoUrl) {
-          videoDuration = await getVideoDuration(videoUrl);
-          console.log(`[subtitle] Video: filename="${videoFilename}", duration=${videoDuration?.toFixed(1) ?? 'unknown'}s`);
-        } else {
-          console.log(`[subtitle] Stream has no direct URL (torrent/debrid), filename="${videoFilename}"`);
-        }
-      } else {
-        console.log(`[subtitle] No streams found`);
       }
     } catch (e: any) {
       console.log(`[subtitle] Stream fetch failed: ${e.message}`);
     }
-  }
+  })();
 
-  // 3. Fetch subtitles from ALL upstream sub addons in parallel
-  //    Track which addon provided each subtitle for cross-correlation
-  const subResults = await Promise.allSettled(
+  // 2b. Fetch subtitles from ALL upstream sub addons in parallel
+  const subPromise = Promise.allSettled(
     config.subUrls.map(async (subUrl, sourceIdx) => {
       const subBaseUrl = await getUpstreamBaseUrl(subUrl);
       const upstreamSubUrl = `${subBaseUrl}/subtitles/${type}/${decodedId}.json`;
       const data = await fetchJson<{ subtitles: Subtitle[] }>(upstreamSubUrl);
       const subs = data?.subtitles || [];
-      // Tag each subtitle with its source addon index + preserve releaseName
       return subs.map((s) => ({
         ...s,
         _source: sourceIdx,
@@ -366,6 +380,21 @@ router.get('/subtitles/:type/*', async (req, res) => {
       } as Subtitle));
     })
   );
+
+  // Wait for stream info first (we need videoUrl for probe)
+  await streamPromise;
+
+  // 2c. Probe video (synchronous — runs while subs continue fetching)
+  if (videoUrl) {
+    videoProbe = probeVideoInfo(videoUrl);
+    videoDuration = videoProbe.duration;
+    console.log(`[subtitle] Video: filename="${videoFilename}", duration=${videoDuration?.toFixed(1) ?? 'unknown'}s, textSubStreams=${videoProbe.subtitleStreams.length}`);
+  } else {
+    console.log(`[subtitle] Video: filename="${videoFilename}", no direct URL`);
+  }
+
+  // Wait for subs to complete (probe already done synchronously above)
+  const subResults = await subPromise;
 
   let allSubs: Subtitle[] = subResults
     .filter((r) => r.status === 'fulfilled')
@@ -491,34 +520,48 @@ router.get('/subtitles/:type/*', async (req, res) => {
   // to find the sync offset between it and the external subtitle.
   // This is the most reliable method — works even when no cross-addon
   // subs are available, and handles translation timing differences.
+  // Uses offset cache to avoid re-extraction for the same video.
   if (offset === 0 && videoUrl && isFfsubsyncAvailable()) {
-    console.log(`[subtitle] Strategy C (ffsubsync): checking for builtin subs...`);
-    const refStream = findBestRefSubtitleStream(videoUrl);
-    if (refStream) {
-      console.log(`[subtitle] Strategy C: extracting builtin sub stream ${refStream.index} (${refStream.lang})...`);
-      const builtinSrt = extractBuiltinSubtitle(videoUrl, refStream.index, 60);
-      if (builtinSrt) {
-        // Sync against the best-matching external subtitle
-        const bestSub = allSubs[0];
-        if (bestSub) {
-          const realUrl = resolveRealUrl(bestSub.url);
-          console.log(`[subtitle] Strategy C: running ffsubsync against best sub...`);
-          const subContent = await fetchText(realUrl);
-          if (subContent) {
-            const ffsubsyncOffset = calculateOffsetWithFfsubsync(builtinSrt, subContent);
-            if (ffsubsyncOffset !== 0) {
-              offset = ffsubsyncOffset;
-              console.log(`[subtitle] Strategy C (ffsubsync): offset=${offset.toFixed(3)}s`);
-            } else {
-              console.log(`[subtitle] Strategy C (ffsubsync): no offset detected (subs already synced)`);
+    // Check offset cache first (avoids re-extraction)
+    const cachedOffset = getOffsetFromCache(videoUrl);
+    if (cachedOffset !== null) {
+      offset = cachedOffset;
+    } else {
+      console.log(`[subtitle] Strategy C (ffsubsync): checking for builtin subs...`);
+      try {
+        // Use pre-probed subtitle streams (from combined ffprobe)
+        const streams = videoProbe?.subtitleStreams || [];
+        if (streams.length === 0) {
+          console.log(`[subtitle] Strategy C: no text subtitle streams found in video`);
+        } else {
+          // Find best English stream from pre-probed list
+          const engStream = streams.find((s: { lang: string }) => s.lang.startsWith('eng') || s.lang === 'en') || streams[0];
+          console.log(`[subtitle] Strategy C: extracting builtin sub stream ${engStream.index} (${engStream.lang})...`);
+          const builtinSrt = extractBuiltinSubtitle(videoUrl, engStream.index, 30);
+          if (builtinSrt) {
+            const bestSub = allSubs[0];
+            if (bestSub) {
+              const realUrl = resolveRealUrl(bestSub.url);
+              console.log(`[subtitle] Strategy C: running ffsubsync against best sub...`);
+              const subContent = await fetchText(realUrl);
+              if (subContent) {
+                const ffsubsyncOffset = calculateOffsetWithFfsubsync(builtinSrt, subContent);
+                if (ffsubsyncOffset !== 0) {
+                  offset = ffsubsyncOffset;
+                  setOffsetCache(videoUrl, offset);
+                  console.log(`[subtitle] Strategy C (ffsubsync): offset=${offset.toFixed(3)}s`);
+                } else {
+                  console.log(`[subtitle] Strategy C (ffsubsync): no offset detected (subs already synced)`);
+                }
+              }
             }
+          } else {
+            console.log(`[subtitle] Strategy C: failed to extract builtin sub (timeout or no text subs)`);
           }
         }
-      } else {
-        console.log(`[subtitle] Strategy C: failed to extract builtin sub (timeout or no text subs)`);
+      } catch (e: any) {
+        console.log(`[subtitle] Strategy C: error: ${e.message?.substring(0, 200)}`);
       }
-    } else {
-      console.log(`[subtitle] Strategy C: no text subtitle streams found in video`);
     }
   } else if (offset === 0 && videoUrl && !isFfsubsyncAvailable()) {
     console.log(`[subtitle] Strategy C: ffsubsync not available, skipping`);

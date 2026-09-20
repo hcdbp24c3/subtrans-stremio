@@ -69,15 +69,22 @@ export function calculateOffsetFromReference(
   return median;
 }
 
-// ── Video duration ─────────────────────────────────────────────────
-export async function getVideoDuration(url: string): Promise<number | null> {
+// ── Video probe (combined duration + streams) ─────────────────────
+
+/** Resolve redirects via curl (Node fetch gets 404 on some CDNs) */
+function resolveRedirect(url: string): string {
   try {
-    let probeUrl = url;
     const location = execSync(
       `curl -sI --max-time 10 "${url}" 2>/dev/null | grep -i "^location:" | tail -1 | tr -d '\\r' | awk '{print $2}'`,
       { encoding: 'utf-8', timeout: 15000 },
     ).trim();
-    if (location) { probeUrl = location; }
+    return location || url;
+  } catch { return url; }
+}
+
+export async function getVideoDuration(url: string): Promise<number | null> {
+  try {
+    const probeUrl = resolveRedirect(url);
     const result = execSync(
       `ffprobe -v error -show_entries format=duration -analyzeduration 5000000 -probesize 1000000 "${probeUrl}" 2>/dev/null`,
       { encoding: 'utf-8', timeout: 30000 },
@@ -85,6 +92,53 @@ export async function getVideoDuration(url: string): Promise<number | null> {
     const match = result.match(/duration=([\d.]+)/);
     return match ? parseFloat(match[1]) : null;
   } catch { return null; }
+}
+
+export interface VideoProbeResult {
+  duration: number | null;
+  subtitleStreams: SubtitleStreamInfo[];
+}
+
+/**
+ * Combined ffprobe: get duration + subtitle streams in ONE call.
+ * Resolves redirects once, then runs a single ffprobe with both requests.
+ * This cuts the two sequential ffprobe calls (30s each) down to one.
+ */
+export function probeVideoInfo(url: string): VideoProbeResult {
+  const probeUrl = resolveRedirect(url);
+  try {
+    const result = execSync(
+      `ffprobe -v error -show_entries stream=index,codec_name,codec_type:stream_tags=language,title -show_entries format=duration -of csv=p=0 "${probeUrl}" 2>/dev/null`,
+      { encoding: 'utf-8', timeout: 30000 },
+    ).trim();
+
+    const textCodecs = ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'mov_text'];
+    const subtitleStreams: SubtitleStreamInfo[] = [];
+    let duration: number | null = null;
+
+    for (const line of result.split('\n')) {
+      const parts = line.split(',');
+      // Duration line: format=...,{duration}
+      if (parts.length >= 3 && parts[2].trim() === 'subtitle') {
+        const codec = parts[1].trim().toLowerCase();
+        if (textCodecs.includes(codec)) {
+          subtitleStreams.push({
+            index: parseInt(parts[0]),
+            codec,
+            lang: (parts[3] || 'und').trim(),
+            title: (parts[4] || '').trim(),
+          });
+        }
+      }
+      // Format line has duration
+      const durMatch = line.match(/duration=([\d.]+)/);
+      if (durMatch) { duration = parseFloat(durMatch[1]); }
+    }
+
+    return { duration, subtitleStreams };
+  } catch {
+    return { duration: null, subtitleStreams: [] };
+  }
 }
 
 // ── Built-in subtitle extraction ──────────────────────────────────
