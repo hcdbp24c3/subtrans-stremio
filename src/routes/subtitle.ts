@@ -2,7 +2,11 @@ import { Router } from 'express';
 import { decodeConfig, encodeConfig, AddonConfig } from '../config.js';
 import { fetchJson, fetchText } from '../lib/proxy.js';
 import { detectFormat, parseSubtitle, SubtitleFormat } from '../lib/subtitle-parser.js';
-import { calculateOffsetFromReference, getVideoDuration, adjustEntries } from '../lib/aligner.js';
+import {
+  calculateOffsetFromReference, getVideoDuration, adjustEntries,
+  findBestRefSubtitleStream, extractBuiltinSubtitle,
+  calculateOffsetWithFfsubsync, isFfsubsyncAvailable,
+} from '../lib/aligner.js';
 
 const router = Router();
 
@@ -480,6 +484,44 @@ router.get('/subtitles/:type/*', async (req, res) => {
         console.log(`[subtitle] Strategy B (cross-addon): addons agree (no offset detected)`);
       }
     }
+  }
+
+  // ── Strategy C: Subtitle-to-subtitle sync via ffsubsync ──────────
+  // Extract built-in English subtitle from the video, then use ffsubsync
+  // to find the sync offset between it and the external subtitle.
+  // This is the most reliable method — works even when no cross-addon
+  // subs are available, and handles translation timing differences.
+  if (offset === 0 && videoUrl && isFfsubsyncAvailable()) {
+    console.log(`[subtitle] Strategy C (ffsubsync): checking for builtin subs...`);
+    const refStream = findBestRefSubtitleStream(videoUrl);
+    if (refStream) {
+      console.log(`[subtitle] Strategy C: extracting builtin sub stream ${refStream.index} (${refStream.lang})...`);
+      const builtinSrt = extractBuiltinSubtitle(videoUrl, refStream.index, 60);
+      if (builtinSrt) {
+        // Sync against the best-matching external subtitle
+        const bestSub = allSubs[0];
+        if (bestSub) {
+          const realUrl = resolveRealUrl(bestSub.url);
+          console.log(`[subtitle] Strategy C: running ffsubsync against best sub...`);
+          const subContent = await fetchText(realUrl);
+          if (subContent) {
+            const ffsubsyncOffset = calculateOffsetWithFfsubsync(builtinSrt, subContent);
+            if (ffsubsyncOffset !== 0) {
+              offset = ffsubsyncOffset;
+              console.log(`[subtitle] Strategy C (ffsubsync): offset=${offset.toFixed(3)}s`);
+            } else {
+              console.log(`[subtitle] Strategy C (ffsubsync): no offset detected (subs already synced)`);
+            }
+          }
+        }
+      } else {
+        console.log(`[subtitle] Strategy C: failed to extract builtin sub (timeout or no text subs)`);
+      }
+    } else {
+      console.log(`[subtitle] Strategy C: no text subtitle streams found in video`);
+    }
+  } else if (offset === 0 && videoUrl && !isFfsubsyncAvailable()) {
+    console.log(`[subtitle] Strategy C: ffsubsync not available, skipping`);
   }
 
   // 7. If offset detected, re-download all subs and re-serialize with offset applied
