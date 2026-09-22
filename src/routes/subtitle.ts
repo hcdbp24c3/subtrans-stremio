@@ -14,11 +14,14 @@ import {
   releaseNameMatchScore,
   sortByReleaseMatch,
 } from '../lib/release-match.js';
+import { createTtlStore } from '../lib/ttl-store.js';
 
 const router = Router();
 
 const MAX_SUBS_PER_LANG = 5;
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const SUB_DOWNLOAD_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const subDownloadCache = createTtlStore<{ body: Buffer; contentType: string }>(100);
 
 interface Subtitle {
   id: string;
@@ -523,6 +526,15 @@ async function handleSubDownload(req: any, res: any) {
       }
     } catch {}
 
+    const cacheKey = `${(req.params.ext || 'srt').toLowerCase()}|${realUrl}`;
+    const hit = subDownloadCache.get(cacheKey);
+    if (hit) {
+      res.setHeader('Content-Type', hit.contentType);
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('X-Subtitle-Cache', 'hit');
+      res.send(hit.body);
+      return;
+    }
     console.log('[subdownload] Proxying:', realUrl.substring(0, 120));
     const response = await fetch(realUrl, {
       headers: {
@@ -546,8 +558,6 @@ async function handleSubDownload(req: any, res: any) {
       ass: 'text/x-ssa; charset=utf-8',
       ssa: 'text/x-ssa; charset=utf-8',
     };
-    res.setHeader('Content-Type', mimeMap[ext] || 'text/plain; charset=utf-8');
-    res.setHeader('Access-Control-Allow-Origin', '*');
 
     // Read content, strip BOM if present, then send
     if (response.body) {
@@ -563,20 +573,25 @@ async function handleSubDownload(req: any, res: any) {
 
       // Stremio only supports SRT/VTT — convert ASS/SSA to SRT on the fly
       const upstreamFormat = detectFormat(url) || ((ext === 'ass' || ext === 'ssa') ? 'ass' : null);
+      let finalContent = rawContent;
+      let finalContentType = mimeMap[ext] || 'text/plain; charset=utf-8';
       if (upstreamFormat === 'ass') {
         const entries = parseSubtitle(rawContent, 'ass');
         if (entries.length > 0) {
           const srtContent = reSerialize(entries, 'srt');
           if (srtContent) {
-            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-            res.send(srtContent);
-            return;
+            finalContent = srtContent;
+            finalContentType = 'text/plain; charset=utf-8';
           }
         }
       }
 
-      // SRT/VTT: send as-is
-      res.send(rawContent);
+      const bodyBuf = Buffer.from(finalContent, 'utf-8');
+      subDownloadCache.set(cacheKey, { body: bodyBuf, contentType: finalContentType }, SUB_DOWNLOAD_CACHE_TTL_MS);
+      res.setHeader('Content-Type', finalContentType);
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.send(bodyBuf);
+      return;
     } else {
       res.end();
     }
