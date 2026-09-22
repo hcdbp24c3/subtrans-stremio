@@ -166,6 +166,23 @@ function limitPerLanguage(subs: Subtitle[], limit: number): Subtitle[] {
   });
 }
 
+/**
+ * Strategy D helper: if the best subtitle's last cue ends well past the
+ * video duration, the sub is from a longer cut — shift it back.
+ * Returns a negative offset (seconds) or 0 when no confident overrun.
+ */
+export function durationOverrunOffset(
+  videoDuration: number | null,
+  lastCueEnd: number,
+  slackSec = 3,
+): number {
+  if (videoDuration === null || !Number.isFinite(videoDuration) || !Number.isFinite(lastCueEnd)) return 0;
+  const overrun = lastCueEnd - videoDuration;
+  if (overrun <= slackSec) return 0;
+  const offset = videoDuration - lastCueEnd; // negative
+  return Math.max(offset, -600);
+}
+
 /** Drop duplicate subtitle entries by exact URL, keeping first occurrence. */
 export function dedupeSubtitles(subs: Subtitle[]): Subtitle[] {
   const seen = new Set<string>();
@@ -441,6 +458,34 @@ router.get('/subtitles/:type/*', async (req, res) => {
     }
   } else if (offset === 0 && videoUrl && !isFfsubsyncAvailable()) {
     console.log(`[subtitle] Strategy C: ffsubsync not available, skipping`);
+  }
+
+  // ── Strategy D: duration overrun (last resort) ─────────────────────
+  // Strategies A–C can all no-op when every sub is the wrong encode and
+  // the video has no text builtin subs. If the best sub's last cue runs
+  // well past the probed video duration, shift it back.
+  if (offset === 0 && videoDuration && allSubs.length > 0) {
+    const bestSub = allSubs[0];
+    const fmt = (bestSub._format || 'srt') as SubtitleFormat;
+    try {
+      const realUrl = resolveRealUrl(bestSub.url);
+      const subContent = await fetchText(realUrl);
+      if (subContent) {
+        const entries = parseSubtitle(subContent, fmt);
+        if (entries.length > 0) {
+          const lastCueEnd = entries[entries.length - 1].end;
+          const dOffset = durationOverrunOffset(videoDuration, lastCueEnd);
+          if (dOffset !== 0) {
+            offset = dOffset;
+            console.log(`[subtitle] Strategy D (duration overrun): sub ends ${lastCueEnd.toFixed(1)}s > video ${videoDuration.toFixed(1)}s → offset=${offset.toFixed(1)}s`);
+          } else {
+            console.log(`[subtitle] Strategy D (duration overrun): no overrun (sub end=${lastCueEnd.toFixed(1)}s, video=${videoDuration.toFixed(1)}s)`);
+          }
+        }
+      }
+    } catch (e: any) {
+      console.log(`[subtitle] Strategy D: error: ${e.message?.substring(0, 200)}`);
+    }
   }
 
   // 7. If offset detected, re-download all subs and re-serialize with offset applied
