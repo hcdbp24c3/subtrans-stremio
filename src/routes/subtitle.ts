@@ -163,6 +163,16 @@ function limitPerLanguage(subs: Subtitle[], limit: number): Subtitle[] {
   });
 }
 
+/** Drop duplicate subtitle entries by exact URL, keeping first occurrence. */
+export function dedupeSubtitles(subs: Subtitle[]): Subtitle[] {
+  const seen = new Set<string>();
+  return subs.filter((s) => {
+    if (seen.has(s.url)) return false;
+    seen.add(s.url);
+    return true;
+  });
+}
+
 // ── Route ──────────────────────────────────────────────────────────
 // Stremio appends extra path segments to subtitle URLs:
 //   /subtitles/movie/tt27681354/filename=...mkv&videoSize=...json
@@ -262,6 +272,11 @@ router.get('/subtitles/:type/*', async (req, res) => {
   // 4. Filter + limit
   allSubs = filterByLanguage(allSubs, config.languages);
   allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
+  const beforeDedupe = allSubs.length;
+  allSubs = dedupeSubtitles(allSubs);
+  if (allSubs.length !== beforeDedupe) {
+    console.log(`[subtitle] Deduped ${beforeDedupe - allSubs.length} duplicate URL(s)`);
+  }
 
   // 5. Detect format for alignment (BEFORE URL rewrite — all URLs are still original upstream URLs)
   allSubs = allSubs.map((sub) => ({
