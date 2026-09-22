@@ -8,6 +8,12 @@ import {
   calculateOffsetWithFfsubsync, isFfsubsyncAvailable,
   probeVideoInfo, VideoProbeResult,
 } from '../lib/aligner.js';
+import {
+  extractEncodeKeywords,
+  encodeCompatible,
+  releaseNameMatchScore,
+  sortByReleaseMatch,
+} from '../lib/release-match.js';
 
 const router = Router();
 
@@ -157,160 +163,6 @@ function limitPerLanguage(subs: Subtitle[], limit: number): Subtitle[] {
   });
 }
 
-// ── Release name matching ─────────────────────────────────────────
-
-/**
- * Normalize a release name/filename for comparison.
- * Strips extensions, codec info, common prefixes, and lowercases.
- * e.g. "In.the.Grey.2026.1080p.AMZN.WEB-DL.DDP5.1.Atmos.H.264-BYNDR.mkv"
- *   → "in the grey 2026 1080p amzn web dl ddp51 atmos h264 byndr"
- */
-function normalizeReleaseName(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/\.(mkv|mp4|avi|srt|ass|vtt|ts)$/i, '') // strip video/sub extensions
-    .replace(/[._]/g, ' ')                             // dots/underscores → spaces
-    .replace(/\s+/g, ' ')                              // collapse whitespace
-    .trim();
-}
-
-/**
- * Extract video source/encode keywords from a release name.
- * These determine subtitle timing — subs synced for one source
- * won't match another due to different intros/outros.
- *
- * Returns a Set of normalized encode tokens: "bluray", "remux", "web-dl",
- * "webrip", "hdtv", "dvdrip", "hdrip", "bdrip", "hdtv".
- */
-function extractEncodeKeywords(releaseName: string): Set<string> {
-  const norm = normalizeReleaseName(releaseName);
-  const tokens = norm.split(' ');
-  const encodeMap: Record<string, string> = {
-    'bluray': 'bluray', 'bdrip': 'bluray', 'brrip': 'bluray',
-    'remux': 'remux',
-    'web-dl': 'web-dl', 'webdl': 'web-dl', 'webrip': 'webrip', 'web': 'web-dl',
-    'hdtv': 'hdtv',
-    'dvdrip': 'dvdrip',
-    'hdrip': 'hdrip',
-  };
-  const result = new Set<string>();
-  for (const t of tokens) {
-    const mapped = encodeMap[t];
-    if (mapped) result.add(mapped);
-  }
-  return result;
-}
-
-/**
- * Check if two encode keyword sets are compatible.
- * e.g. {bluray, remux} vs {web-dl} → incompatible
- *      {bluray} vs {bluray} → compatible
- *      {} vs {web-dl} → compatible (unknown = any)
- */
-function encodeCompatible(a: Set<string>, b: Set<string>): boolean {
-  if (a.size === 0 || b.size === 0) return true; // unknown = compatible
-  // Check if any keyword matches
-  for (const kw of a) {
-    if (b.has(kw)) return true;
-  }
-  return false;
-}
-
-/**
- * Score how well two encode keyword sets match.
- * Returns 0-1: 1 = same source, 0 = incompatible.
- */
-function encodeMatchScore(a: Set<string>, b: Set<string>): number {
-  if (a.size === 0 || b.size === 0) return 0.5; // unknown = neutral
-  for (const kw of a) {
-    if (b.has(kw)) return 1;
-  }
-  return 0;
-}
-
-/**
- * Calculate how well a subtitle release name matches a video filename.
- * Returns 0-1 (1 = perfect match, 0 = no match).
- *
- * Two-phase scoring:
- *   Phase 1 — Encode compatibility (hard filter): video source (bluray/remux/web-dl)
- *             must match subtitle source. Incompatible encodes get score 0.
- *   Phase 2 — Token overlap: among compatible subs, rank by name similarity.
- *
- * This ensures subs for "BluRay.REMUX" rank above subs for "WEB-DL" when
- * the video is BluRay.
- */
-function releaseNameMatchScore(videoFilename: string, subReleaseName: string): number {
-  if (!videoFilename || !subReleaseName) return 0;
-
-  const videoNorm = normalizeReleaseName(videoFilename);
-  const subNorm = normalizeReleaseName(subReleaseName);
-
-  if (!videoNorm || !subNorm) return 0;
-  if (videoNorm === subNorm) return 1;
-
-  // Phase 1: Encode compatibility — HARD FILTER
-  const videoEncode = extractEncodeKeywords(videoFilename);
-  const subEncode = extractEncodeKeywords(subReleaseName);
-  const compatible = encodeCompatible(videoEncode, subEncode);
-  if (!compatible) {
-    console.log(`[subtitle] Encode mismatch: video=[${[...videoEncode]}] sub=[${[...subEncode]}] "${subReleaseName}"`);
-    return 0;
-  }
-
-  // Phase 2: Token overlap scoring
-  // Noise tokens that don't help distinguish releases (but encode tokens are NOT noise here)
-  const noiseTokens = new Set([
-    '1080p', '2160p', '720p', '480p', '4k', 'uhd',
-    'x264', 'x265', 'h264', 'h265', 'hevc', 'avc', 'av1',
-    'aac', 'ac3', 'ddp', 'ddp5', 'ddp51', 'eac3', 'truehd', 'atmos', 'dd51',
-    'hdr', 'hdr10', 'dolby', 'vision', 'dv', 'sdr',
-    '10bit', 'hdrp',
-    // encode tokens are now handled separately, add to noise to avoid double-counting
-    'bluray', 'bdrip', 'brrip', 'remux', 'web', 'web-dl', 'webdl', 'webrip',
-    'hdtv', 'dvdrip', 'hdrip',
-  ]);
-
-  const videoTokens = new Set(videoNorm.split(' ').filter((t) => t.length > 1));
-  const subTokens = subNorm.split(' ').filter((t) => t.length > 1);
-
-  // Filter noise from both
-  const videoMeaningful = [...videoTokens].filter((t) => !noiseTokens.has(t));
-  const subMeaningful = subTokens.filter((t) => !noiseTokens.has(t));
-
-  if (videoMeaningful.length === 0 || subMeaningful.length === 0) return 0;
-
-  // Count overlapping meaningful tokens
-  const subSet = new Set(subMeaningful);
-  let matchCount = 0;
-  for (const vt of videoMeaningful) {
-    if (subSet.has(vt)) matchCount++;
-  }
-
-  // Score = matched meaningful tokens / total meaningful tokens in subtitle
-  const score = matchCount / subMeaningful.length;
-
-  // Boost score slightly when encode matches perfectly (same source keyword)
-  const encodeBoost = encodeMatchScore(videoEncode, subEncode) * 0.1;
-  const finalScore = Math.min(1, score + encodeBoost);
-
-  if (finalScore >= 0.5) {
-    console.log(`[subtitle] Release match: score=${finalScore.toFixed(2)} encode=${[...subEncode]} "${subReleaseName}" ↔ "${videoFilename}"`);
-  }
-
-  return finalScore;
-}
-
-/** Sort subs by release name match score (best match first) */
-function sortByReleaseMatch(subs: Subtitle[], videoFilename: string | null): Subtitle[] {
-  if (!videoFilename) return subs;
-  return [...subs].sort((a, b) => {
-    const scoreA = releaseNameMatchScore(videoFilename, a._releaseName || '');
-    const scoreB = releaseNameMatchScore(videoFilename, b._releaseName || '');
-    return scoreB - scoreA; // higher score first
-  });
-}
-
 // ── Route ──────────────────────────────────────────────────────────
 // Stremio appends extra path segments to subtitle URLs:
 //   /subtitles/movie/tt27681354/filename=...mkv&videoSize=...json
@@ -429,15 +281,21 @@ router.get('/subtitles/:type/*', async (req, res) => {
     allSubs = sortByReleaseMatch(allSubs, videoFilename);
     const bestMatch = allSubs[0];
     const bestScore = releaseNameMatchScore(videoFilename, bestMatch?._releaseName || '');
-    // Count how many subs match the video encode vs mismatched
     const videoEncode = extractEncodeKeywords(videoFilename);
     let encodeMatch = 0, encodeMismatch = 0;
+    let firstMismatchName = '';
     for (const s of allSubs) {
       const subEnc = extractEncodeKeywords(s._releaseName || '');
       if (encodeCompatible(videoEncode, subEnc)) encodeMatch++;
-      else encodeMismatch++;
+      else {
+        encodeMismatch++;
+        if (!firstMismatchName) firstMismatchName = s._releaseName || '';
+      }
     }
     console.log(`[subtitle] Strategy A (release match): best=${bestScore.toFixed(2)} (${encodeMatch} matched, ${encodeMismatch} mismatched encode)`);
+    if (encodeMismatch > 0) {
+      console.log(`[subtitle] Encode mismatch example: video=[${[...videoEncode]}] sub=[${[...extractEncodeKeywords(firstMismatchName)]}] "${firstMismatchName}"`);
+    }
     if (encodeMatch === 0 && videoEncode.size > 0 && allSubs.length > 0) {
       console.log(`[subtitle] ⚠ NO SUBS FOR THIS ENCODE: video needs [${[...videoEncode].join(',')}], ${encodeMismatch} subs all from different encodes`);
       console.log(`[subtitle] Serving best available sub but timing may differ. Use Stremio offset to adjust.`);
