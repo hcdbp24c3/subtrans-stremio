@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { calculateOffsetFromReference, adjustEntries, parseFfsubsyncOutput, SubtitleEntry } from '../src/lib/aligner.js';
+import {
+  calculateOffsetFromReference, adjustEntries, parseFfsubsyncOutput,
+  countSrtEntries, parseDurationFromProbeLine, SubtitleEntry,
+} from '../src/lib/aligner.js';
 
 describe('parseFfsubsyncOutput', () => {
   it('parses offset and score', () => {
@@ -13,6 +16,38 @@ describe('parseFfsubsyncOutput', () => {
 
   it('returns null when no offset line', () => {
     expect(parseFfsubsyncOutput('nothing here')).toBeNull();
+  });
+});
+
+describe('countSrtEntries', () => {
+  it('counts numbered cue indices', () => {
+    const srt = '1\n00:00:01,000 --> 00:00:02,000\nHi\n\n2\n00:00:03,000 --> 00:00:04,000\nYo';
+    expect(countSrtEntries(srt)).toBe(2);
+  });
+
+  it('returns 0 for empty content', () => {
+    expect(countSrtEntries('')).toBe(0);
+  });
+});
+
+describe('parseDurationFromProbeLine', () => {
+  it('parses bare float (csv=p=0 format duration line)', () => {
+    expect(parseDurationFromProbeLine('5839.638000')).toBe(5839.638);
+  });
+
+  it('parses duration= form', () => {
+    expect(parseDurationFromProbeLine('duration=120.5')).toBe(120.5);
+    expect(parseDurationFromProbeLine('[FORMAT]\nduration=120.5\n[/FORMAT]'.split('\n')[1])).toBe(120.5);
+  });
+
+  it('returns null for stream CSV lines', () => {
+    expect(parseDurationFromProbeLine('9,subrip,subtitle,eng,BTM SDH')).toBeNull();
+    expect(parseDurationFromProbeLine('0,hevc,video,eng,BEN.THE.MEN')).toBeNull();
+  });
+
+  it('returns null for zero or empty', () => {
+    expect(parseDurationFromProbeLine('0')).toBeNull();
+    expect(parseDurationFromProbeLine('')).toBeNull();
   });
 });
 

@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import { writeFileSync, existsSync, readFileSync, unlinkSync } from 'fs';
+import { writeFileSync, existsSync, readFileSync, unlinkSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { SubtitleEntry } from './subtitle-parser.js';
@@ -100,6 +100,22 @@ export interface VideoProbeResult {
 }
 
 /**
+ * Parse one ffprobe CSV line for format duration.
+ * Handles `duration=N` and bare `N` (`-of csv=p=0`).
+ * Returns null when the line is not a duration value.
+ */
+export function parseDurationFromProbeLine(line: string): number | null {
+  const durMatch = line.match(/duration=([\d.]+)/);
+  if (durMatch) return parseFloat(durMatch[1]);
+  const trimmed = line.trim();
+  if (/^\d+(\.\d+)?$/.test(trimmed)) {
+    const n = parseFloat(trimmed);
+    if (n > 0) return n;
+  }
+  return null;
+}
+
+/**
  * Combined ffprobe: get duration + subtitle streams in ONE call.
  * Resolves redirects once, then runs a single ffprobe with both requests.
  * This cuts the two sequential ffprobe calls (30s each) down to one.
@@ -118,7 +134,6 @@ export function probeVideoInfo(url: string): VideoProbeResult {
 
     for (const line of result.split('\n')) {
       const parts = line.split(',');
-      // Duration line: format=...,{duration}
       if (parts.length >= 3 && parts[2].trim() === 'subtitle') {
         const codec = parts[1].trim().toLowerCase();
         if (textCodecs.includes(codec)) {
@@ -130,9 +145,8 @@ export function probeVideoInfo(url: string): VideoProbeResult {
           });
         }
       }
-      // Format line has duration
-      const durMatch = line.match(/duration=([\d.]+)/);
-      if (durMatch) { duration = parseFloat(durMatch[1]); }
+      const d = parseDurationFromProbeLine(line);
+      if (d !== null) duration = d;
     }
 
     return { duration, subtitleStreams };
@@ -201,8 +215,7 @@ export function extractBuiltinSubtitle(videoUrl: string, streamIndex: number, ti
       const content = readFileSync(tmpFile, 'utf-8');
       try { unlinkSync(tmpFile); } catch {}
       if (content.trim().length > 0) {
-        const entryCount = (content.match(/^\d+$/gm) || []).length;
-        console.log(`[aligner] Extracted builtin sub: ${content.length} bytes, ${entryCount} entries`);
+        console.log(`[aligner] Extracted builtin sub: ${content.length} bytes, ${countSrtEntries(content)} entries`);
         return content;
       }
     }
@@ -214,8 +227,7 @@ export function extractBuiltinSubtitle(videoUrl: string, streamIndex: number, ti
         const content = readFileSync(tmpFile, 'utf-8');
         try { unlinkSync(tmpFile); } catch {}
         if (content.trim().length > 100) {
-          const entryCount = (content.match(/^\d+$/gm) || []).length;
-          console.log(`[aligner] Recovered partial builtin sub: ${content.length} bytes, ${entryCount} entries`);
+          console.log(`[aligner] Recovered partial builtin sub: ${content.length} bytes, ${countSrtEntries(content)} entries`);
           return content;
         }
       } catch {}
@@ -247,9 +259,87 @@ export function parseFfsubsyncOutput(output: string): { offset: number; score: n
   };
 }
 
+/** Count numbered SRT cue indices in content (diagnostics). */
+export function countSrtEntries(content: string): number {
+  return (content.match(/^\d+$/gm) || []).length;
+}
+
+/**
+ * Run ffsubsync against a local reference file (SRT or WAV).
+ * Returns 0 when unavailable / no offset / low confidence.
+ */
+function runFfsubsyncLocal(refPath: string, targetSubContent: string, label: string): number {
+  const targetFile = join(tmpdir(), `ffs_target_${Date.now()}.srt`);
+  const outputFile = join(tmpdir(), `ffs_out_${Date.now()}.srt`);
+  try {
+    writeFileSync(targetFile, targetSubContent, 'utf-8');
+    const result = execSync(
+      `ffsubsync "${refPath}" -i "${targetFile}" -o "${outputFile}" --no-fix-framerate 2>&1`,
+      { encoding: 'utf-8', timeout: 30000, maxBuffer: 10 * 1024 * 1024 },
+    );
+    const parsed = parseFfsubsyncOutput(result);
+    if (!parsed) {
+      console.log(`[aligner] ffsubsync(${label}): no offset found in output`);
+      return 0;
+    }
+    console.log(`[aligner] ffsubsync(${label}): offset=${parsed.offset.toFixed(3)}s, score=${parsed.score}`);
+    if (parsed.score <= 0) {
+      console.log(`[aligner] ffsubsync(${label}): low confidence (score<=0), ignoring offset`);
+      return 0;
+    }
+    return parsed.offset;
+  } catch (e: any) {
+    console.log(`[aligner] ffsubsync(${label}) failed: ${e.message?.substring(0, 200)}`);
+    return 0;
+  } finally {
+    try { unlinkSync(targetFile); } catch {}
+    try { unlinkSync(outputFile); } catch {}
+  }
+}
+
+/**
+ * Extract a bounded local audio sample (mono 16 kHz WAV) from a video URL.
+ * Partial file on timeout is accepted if large enough for ffsubsync.
+ */
+export function extractAudioSample(videoUrl: string, seconds = 180, timeoutSec = 45): string | null {
+  const tmpFile = join(tmpdir(), `audio_sample_${Date.now()}.wav`);
+  const cmd = `timeout ${timeoutSec} ffmpeg -y -i "${videoUrl}" -t ${seconds} -vn -ac 1 -ar 16000 -c:a pcm_s16le "${tmpFile}" 2>/dev/null`;
+  try {
+    console.log(`[aligner] Extracting ${seconds}s audio sample (timeout ${timeoutSec}s)...`);
+    execSync(cmd, { encoding: 'utf-8', timeout: (timeoutSec + 5) * 1000 });
+  } catch {
+    // timeout(1) leaves a partial WAV — recover if usable
+    if (existsSync(tmpFile)) {
+      try {
+        const size = statSync(tmpFile).size;
+        // WAV header 44B + ≥5s of 16-bit mono 16 kHz
+        if (size > 44 + 5 * 16000 * 2) {
+          console.log(`[aligner] Recovered partial audio sample: ${size} bytes`);
+          return tmpFile;
+        }
+      } catch {}
+    }
+    try { unlinkSync(tmpFile); } catch {}
+    console.log(`[aligner] Audio sample extract failed`);
+    return null;
+  }
+  if (existsSync(tmpFile)) {
+    try {
+      const size = statSync(tmpFile).size;
+      if (size > 44 + 5 * 16000 * 2) {
+        console.log(`[aligner] Audio sample ready: ${size} bytes`);
+        return tmpFile;
+      }
+    } catch {}
+    try { unlinkSync(tmpFile); } catch {}
+  }
+  return null;
+}
+
 /**
  * Sync a subtitle against the VIDEO (audio/VAD reference) via ffsubsync.
  * Works when the video has no text builtin subs (PGS-only remuxes).
+ * Prefer calculateOffsetSmart — remote full-file sync is slow on large REMUXes.
  */
 export function calculateOffsetWithFfsubsyncVideo(videoUrl: string, targetSubContent: string): number {
   const targetFile = join(tmpdir(), `ffs_target_${Date.now()}.srt`);
@@ -285,42 +375,73 @@ export function calculateOffsetWithFfsubsyncVideo(videoUrl: string, targetSubCon
   }
 }
 
+export type OffsetMethod = 'builtin-sub' | 'audio-sample' | 'video-remote';
+
+export interface SmartOffsetResult {
+  offset: number;
+  method: OffsetMethod;
+}
+
+/**
+ * Fast offset cascade (benchmarked on 62GB Real-Debrid REMUX):
+ *  1. Builtin text sub extract → sub-to-sub (~50s extract + ~2s sync)
+ *  2. Bounded local audio sample → local ffsubsync (~45s + ~3s)
+ *  3. Full remote video reference (slow; may timeout on huge files)
+ */
+export function calculateOffsetSmart(
+  videoUrl: string,
+  targetSubContent: string,
+  textStreams: SubtitleStreamInfo[] = [],
+): SmartOffsetResult {
+  // 1) Builtin text subtitle reference (fastest reliable path)
+  const eng = textStreams.find((s) => s.lang.startsWith('eng') || s.lang === 'en')
+    ?? textStreams[0];
+  if (eng) {
+    const refSrt = extractBuiltinSubtitle(videoUrl, eng.index, 45);
+    if (refSrt && countSrtEntries(refSrt) >= 3) {
+      const refPath = writeTempSrt(refSrt, `ref_${eng.index}`);
+      try {
+        const offset = runFfsubsyncLocal(refPath, targetSubContent, `builtin-sub#${eng.index}`);
+        if (offset !== 0) return { offset, method: 'builtin-sub' };
+      } finally {
+        try { unlinkSync(refPath); } catch {}
+      }
+    }
+  }
+
+  // 2) Local audio sample + ffsubsync (works for PGS-only remuxes)
+  const wavPath = extractAudioSample(videoUrl, 180, 45);
+  if (wavPath) {
+    try {
+      const offset = runFfsubsyncLocal(wavPath, targetSubContent, 'audio-sample');
+      if (offset !== 0) return { offset, method: 'audio-sample' };
+    } finally {
+      try { unlinkSync(wavPath); } catch {}
+    }
+  }
+
+  // 3) Full remote video path (last resort)
+  const offset = calculateOffsetWithFfsubsyncVideo(videoUrl, targetSubContent);
+  return { offset, method: 'video-remote' };
+}
+
+function writeTempSrt(content: string, prefix: string): string {
+  const p = join(tmpdir(), `ffs_${prefix}_${Date.now()}.srt`);
+  writeFileSync(p, content, 'utf-8');
+  return p;
+}
+
 /**
  * Calculate subtitle sync offset using ffsubsync CLI (sub-to-sub reference).
- * Prefer calculateOffsetWithFfsubsyncVideo when a video URL is available.
+ * Prefer calculateOffsetSmart when a video URL is available.
  */
 export function calculateOffsetWithFfsubsync(referenceSrtContent: string, targetSrtContent: string): number {
   const refFile = join(tmpdir(), `ffs_ref_${Date.now()}.srt`);
-  const targetFile = join(tmpdir(), `ffs_target_${Date.now()}.srt`);
-  const outputFile = join(tmpdir(), `ffs_out_${Date.now()}.srt`);
-
   try {
     writeFileSync(refFile, referenceSrtContent);
-    writeFileSync(targetFile, targetSrtContent);
-
-    const result = execSync(
-      `ffsubsync "${refFile}" -i "${targetFile}" -o "${outputFile}" --no-fix-framerate 2>&1`,
-      { encoding: 'utf-8', timeout: 30000 },
-    );
-
-    const parsed = parseFfsubsyncOutput(result);
-    if (!parsed) {
-      console.log(`[aligner] ffsubsync: no offset found in output`);
-      return 0;
-    }
-    console.log(`[aligner] ffsubsync: offset=${parsed.offset.toFixed(3)}s, score=${parsed.score}`);
-    if (parsed.score <= 0) {
-      console.log(`[aligner] ffsubsync: low confidence (score<=0), ignoring offset`);
-      return 0;
-    }
-    return parsed.offset;
-  } catch (e: any) {
-    console.log(`[aligner] ffsubsync failed: ${e.message?.substring(0, 200)}`);
-    return 0;
+    return runFfsubsyncLocal(refFile, targetSrtContent, 'sub-to-sub');
   } finally {
     try { unlinkSync(refFile); } catch {}
-    try { unlinkSync(targetFile); } catch {}
-    try { unlinkSync(outputFile); } catch {}
   }
 }
 

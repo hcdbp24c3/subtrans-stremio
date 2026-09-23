@@ -5,7 +5,7 @@ import {
   detectFormat, sniffFormat, parseSubtitle, SubtitleFormat
 } from '../lib/subtitle-parser.js';
 import {
-  calculateOffsetWithFfsubsyncVideo, adjustEntries,
+  calculateOffsetSmart, adjustEntries,
   isFfsubsyncAvailable,
   probeVideoInfo, VideoProbeResult,
 } from '../lib/aligner.js';
@@ -237,7 +237,7 @@ router.get('/subtitles/:type/*', async (req, res) => {
   if (videoUrl) {
     videoProbe = probeVideoInfo(videoUrl);
     videoDuration = videoProbe.duration;
-    console.log(`[subtitle] Video: filename="${videoFilename}", duration=${videoDuration?.toFixed(1) ?? 'unknown'}s, textSubStreams=${videoProbe.subtitleStreams.length}`);
+    console.log(`[subtitle] Video: filename="${videoFilename}", duration=${videoDuration != null ? `${videoDuration.toFixed(1)}s` : 'unknown'}, textSubStreams=${videoProbe.subtitleStreams.length}`);
   } else {
     console.log(`[subtitle] Video: filename="${videoFilename}", no direct URL`);
   }
@@ -295,12 +295,17 @@ router.get('/subtitles/:type/*', async (req, res) => {
                 analysisSrt = reSerialize(entries, 'srt') || subContent;
               }
             }
-            offset = calculateOffsetWithFfsubsyncVideo(videoUrl, analysisSrt);
+            const smart = calculateOffsetSmart(
+              videoUrl,
+              analysisSrt,
+              videoProbe?.subtitleStreams ?? [],
+            );
+            offset = smart.offset;
             if (offset !== 0) {
               setOffsetCache(videoUrl, offset);
-              console.log(`[subtitle] ffsubsync: offset=${offset.toFixed(3)}s (cached for this video)`);
+              console.log(`[subtitle] ffsubsync: offset=${offset.toFixed(3)}s via ${smart.method} (cached for this video)`);
             } else {
-              console.log(`[subtitle] ffsubsync: no offset (already synced or low confidence)`);
+              console.log(`[subtitle] ffsubsync: no offset via ${smart.method} (already synced or low confidence)`);
             }
           }
         } catch (e: any) {
