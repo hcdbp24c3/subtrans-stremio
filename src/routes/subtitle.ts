@@ -7,7 +7,7 @@ import {
 import {
   calculateOffsetSmart, adjustEntries,
   isFfsubsyncAvailable,
-  probeVideoInfo, VideoProbeResult,
+  probeVideoInfoAsync, SmartOffsetResult, VideoProbeResult,
 } from '../lib/aligner.js';
 import { detectFileExt } from './subtitle-ext.js';
 import { createTtlStore } from '../lib/ttl-store.js';
@@ -21,6 +21,25 @@ const subDownloadCache = createTtlStore<{ body: Buffer; contentType: string }>(1
 // Aligned (offset-applied) subtitle bodies keyed by token — Nuvio needs http(s) URLs, not data:
 const alignedSubCache = createTtlStore<{ body: Buffer; contentType: string }>(100);
 const ALIGNED_SUB_TTL_MS = 30 * 60 * 1000; // ≥ subtitle list cache TTL
+
+// Nuvio client aborts each addon after 20s — respond with margin.
+export const HANDLER_BUDGET_MS = 14_000;
+const RESPONSE_MARGIN_MS = 1_500;
+const MIN_ALIGN_WAIT_MS = 3_000;   // don't bother racing alignment under this
+const MIN_APPLY_MS = 4_000;        // need time to re-download + adjust subs
+const PROBE_MIN_MS = 6_000;        // skip ffprobe when the budget is already tight
+
+let ffsubsyncAvailable: boolean | null = null;
+function ffsubsyncReady(): boolean {
+  if (ffsubsyncAvailable === null) {
+    ffsubsyncAvailable = isFfsubsyncAvailable();
+  }
+  return ffsubsyncAvailable;
+}
+
+function sleep(ms: number): Promise<null> {
+  return new Promise((resolve) => setTimeout(() => resolve(null), Math.max(0, ms)));
+}
 
 interface Subtitle {
   id: string;
@@ -66,12 +85,14 @@ function getOffsetFromCache(videoUrl: string): number | null {
   return entry.offset;
 }
 
+/** Cache offset whenever alignment completed — including 0 (already synced). */
 function setOffsetCache(videoUrl: string, offset: number): void {
   if (offsetCache.size > 50) {
     const oldest = offsetCache.keys().next().value;
     if (oldest) offsetCache.delete(oldest);
   }
   offsetCache.set(videoUrl, { offset, expires: Date.now() + OFFSET_CACHE_TTL });
+  console.log(`[subtitle] Offset cached for this video: ${offset.toFixed(3)}s`);
 }
 
 function cacheKey(config: AddonConfig, type: string, id: string): string {
@@ -169,6 +190,9 @@ export function dedupeSubtitles(subs: Subtitle[]): Subtitle[] {
 //   /subtitles/movie/tt27681354/filename=...mkv&videoSize=...json
 // Use wildcard to capture the full path after /subtitles/:type/
 router.get('/subtitles/:type/*', async (req, res) => {
+  const startedAt = Date.now();
+  const budgetLeftMs = () => HANDLER_BUDGET_MS - (Date.now() - startedAt);
+
   const configStr = req.query.config as string;
   if (!configStr) {
     res.status(400).json({ error: 'Missing config' });
@@ -234,19 +258,32 @@ router.get('/subtitles/:type/*', async (req, res) => {
     })
   );
 
-  // Wait for stream info first (we need videoUrl for probe)
+  // Wait for stream info first (we need videoUrl for offset cache / probe)
   await streamPromise;
 
-  // 2c. Probe video (synchronous — runs while subs continue fetching)
+  // 2c. Offset cache first — skip probe entirely on hit
+  let offset = 0;
+  let offsetFromCache = false;
   if (videoUrl) {
-    videoProbe = probeVideoInfo(videoUrl);
+    const cachedOffset = getOffsetFromCache(videoUrl);
+    if (cachedOffset !== null) {
+      offset = cachedOffset;
+      offsetFromCache = true;
+    }
+  }
+
+  // Probe only when alignment still needs it AND the budget allows
+  if (videoUrl && !offsetFromCache && ffsubsyncReady() && budgetLeftMs() > PROBE_MIN_MS) {
+    videoProbe = await probeVideoInfoAsync(videoUrl);
     videoDuration = videoProbe.duration;
     console.log(`[subtitle] Video: filename="${videoFilename}", duration=${videoDuration != null ? `${videoDuration.toFixed(1)}s` : 'unknown'}, textSubStreams=${videoProbe.subtitleStreams.length}`);
+  } else if (videoUrl) {
+    console.log(`[subtitle] Video: filename="${videoFilename}", skipping probe (cache/budget)`);
   } else {
     console.log(`[subtitle] Video: filename="${videoFilename}", no direct URL`);
   }
 
-  // Wait for subs to complete (probe already done synchronously above)
+  // Wait for subs to complete (probe already awaited above)
   const subResults = await subPromise;
 
   let allSubs: Subtitle[] = subResults
@@ -276,103 +313,104 @@ router.get('/subtitles/:type/*', async (req, res) => {
   })) as Subtitle[];
 
   // 6. Align: single path — ffsubsync against the VIDEO (audio/VAD).
-  //    No encode ranking, no cross-addon, no duration heuristic.
-  let offset = 0;
-  if (videoUrl && isFfsubsyncAvailable()) {
-    const cachedOffset = getOffsetFromCache(videoUrl);
-    if (cachedOffset !== null) {
-      offset = cachedOffset;
-    } else {
-      const bestSub = allSubs[0];
-      if (bestSub) {
-        try {
-          const realUrl = resolveRealUrl(bestSub.url);
-          console.log(`[subtitle] ffsubsync: syncing best sub against video audio...`);
-          const subContent = await fetchText(realUrl);
-          if (subContent) {
-            // ffsubsync wants SRT-shaped text; convert ASS/VTT for analysis only
-            const fmt = (bestSub._format || 'srt') as SubtitleFormat;
-            let analysisSrt = subContent;
-            if (fmt !== 'srt') {
-              const entries = parseSubtitle(subContent, fmt);
-              if (entries.length > 0) {
-                analysisSrt = reSerialize(entries, 'srt') || subContent;
-              }
-            }
-            const smart = calculateOffsetSmart(
-              videoUrl,
-              analysisSrt,
-              videoProbe?.subtitleStreams ?? [],
-            );
-            offset = smart.offset;
-            if (offset !== 0) {
-              setOffsetCache(videoUrl, offset);
-              console.log(`[subtitle] ffsubsync: offset=${offset.toFixed(3)}s via ${smart.method} (cached for this video)`);
-            } else {
-              console.log(`[subtitle] ffsubsync: no offset via ${smart.method} (already synced or low confidence)`);
+  //    Cache offset whenever completed (including 0). If the budget runs out,
+  //    respond unaligned and let alignment finish in the background (warm cache).
+  //    Do NOT cache the subtitle list when alignment was skipped — next request
+  //    must see the warmed offset.
+  let listCacheable = true;
+  if (videoUrl && !offsetFromCache && ffsubsyncReady()) {
+    const bestSub = allSubs[0];
+    if (bestSub) {
+      try {
+        const realUrl = resolveRealUrl(bestSub.url);
+        console.log(`[subtitle] ffsubsync: syncing best sub against video audio...`);
+        const subContent = await fetchText(realUrl);
+        if (subContent) {
+          // ffsubsync wants SRT-shaped text; convert ASS/VTT for analysis only
+          const fmt = (bestSub._format || 'srt') as SubtitleFormat;
+          let analysisSrt = subContent;
+          if (fmt !== 'srt') {
+            const entries = parseSubtitle(subContent, fmt);
+            if (entries.length > 0) {
+              analysisSrt = reSerialize(entries, 'srt') || subContent;
             }
           }
-        } catch (e: any) {
-          console.log(`[subtitle] ffsubsync: error: ${e.message?.substring(0, 200)}`);
+
+          const alignPromise = calculateOffsetSmart(
+            videoUrl,
+            analysisSrt,
+            videoProbe?.subtitleStreams ?? [],
+          ).then((smart: SmartOffsetResult) => {
+            if (smart.completed) {
+              setOffsetCache(videoUrl!, smart.offset);
+              console.log(
+                `[subtitle] ffsubsync: offset=${smart.offset.toFixed(3)}s via ${smart.method}` +
+                (smart.offset === 0 ? ' (already synced)' : ''),
+              );
+            } else {
+              console.log(`[subtitle] ffsubsync: no definitive offset via ${smart.method}`);
+            }
+            return smart;
+          });
+
+          const remaining = budgetLeftMs() - RESPONSE_MARGIN_MS;
+          if (remaining < MIN_ALIGN_WAIT_MS) {
+            // Fire-and-forget: warms offset cache for the next request
+            alignPromise.catch((e: any) => {
+              console.log(`[subtitle] background alignment error: ${e.message?.substring(0, 200)}`);
+            });
+            listCacheable = false;
+            console.log(`[subtitle] time budget low — serving unaligned, warming offset in background`);
+          } else {
+            const smart = await Promise.race([
+              alignPromise,
+              sleep(remaining),
+            ]);
+            if (smart === null) {
+              // Timed out waiting — alignment continues in background
+              alignPromise.catch(() => {});
+              listCacheable = false;
+              console.log(`[subtitle] alignment exceeded budget — serving unaligned, warming in background`);
+            } else {
+              offset = smart.offset;
+              if (!smart.completed) {
+                // Full cascade failed: retrying soon is unlikely to help, but
+                // don't pin a bad "offset=0 forever" — allow a later attempt.
+                listCacheable = false;
+              }
+            }
+          }
         }
+      } catch (e: any) {
+        console.log(`[subtitle] ffsubsync: error: ${e.message?.substring(0, 200)}`);
       }
     }
-  } else if (videoUrl && !isFfsubsyncAvailable()) {
+  } else if (videoUrl && !offsetFromCache && !ffsubsyncReady()) {
     console.log(`[subtitle] ffsubsync not available, serving subs without alignment`);
-  } else {
+  } else if (!videoUrl) {
     console.log(`[subtitle] no video URL, serving subs without alignment`);
   }
 
-  // 7. If offset detected, re-download all subs and re-serialize with offset applied
-  //    (using resolved upstream URLs for download).
+  // 7. If offset detected, re-download all subs and re-serialize with offset applied.
+  //    Parallel downloads; race against the remaining budget so Nuvio never hangs.
   //    Aligned bodies are served from an HTTP endpoint (Nuvio rejects data: URLs).
-  const alignedSubtitles: Subtitle[] = [];
-  for (const sub of allSubs) {
-    if (offset !== 0) {
-      const format = (sub._format || 'srt') as SubtitleFormat | null;
-      if (format) {
-        const realUrl = resolveRealUrl(sub.url);
-        const subContent = await fetchText(realUrl);
-        if (subContent) {
-          let adjustedContent: string | null = null;
-
-          if (format === 'ass') {
-            // Nuvio Android cannot parse ASS (ICU regex crash on unescaped }).
-            // Convert to SRT after offsetting.
-            const entries = parseSubtitle(subContent, 'ass');
-            if (entries.length > 0) {
-              adjustedContent = reSerialize(adjustEntries(entries, offset), 'srt');
-            }
-          } else {
-            // SRT/VTT: parse → adjust → re-serialize
-            const entries = parseSubtitle(subContent, format);
-            if (entries.length > 0) {
-              const adjusted = adjustEntries(entries, offset);
-              adjustedContent = reSerialize(adjusted, format === 'vtt' ? 'srt' : format);
-            }
-          }
-
-          if (adjustedContent) {
-            const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
-            alignedSubCache.set(
-              token,
-              {
-                body: Buffer.from(adjustedContent, 'utf-8'),
-                contentType: 'text/plain; charset=utf-8',
-              },
-              ALIGNED_SUB_TTL_MS,
-            );
-            alignedSubtitles.push({
-              ...sub,
-              url: `aligned:${token}`,
-              _aligned: true,
-            });
-            continue;
-          }
-        }
+  let alignedSubtitles: Subtitle[] = allSubs;
+  if (offset !== 0) {
+    const remaining = budgetLeftMs() - RESPONSE_MARGIN_MS;
+    if (remaining < MIN_APPLY_MS) {
+      listCacheable = false;
+      console.log(`[subtitle] offset=${offset.toFixed(1)}s known but no time to apply — serving unaligned`);
+    } else {
+      const applyPromise = applyOffsetToSubtitles(allSubs, offset);
+      const raced = await Promise.race([applyPromise, sleep(remaining)]);
+      if (raced === null) {
+        applyPromise.catch(() => {});
+        listCacheable = false;
+        console.log(`[subtitle] applying offset exceeded budget — serving unaligned`);
+      } else {
+        alignedSubtitles = raced;
       }
     }
-    alignedSubtitles.push(sub);
   }
 
   // 8. NOW rewrite URLs to proxy format (all content downloads are done)
@@ -397,13 +435,72 @@ router.get('/subtitles/:type/*', async (req, res) => {
       url: `${base}/subdownload${ext}?url=${encodeURIComponent(sub.url)}&config=${configParam}`,
     };
   });
+  // Strip internal fields — clients (Moshi/etc.) only need id/url/lang
   const result = {
-    subtitles: finalSubtitles.map(({ _format, _aligned, ...rest }) => rest),
+    subtitles: finalSubtitles.map(
+      ({ _format, _aligned, _source, _releaseName, ...rest }) => rest,
+    ),
   };
-  setCache(key, result);
+  if (listCacheable) {
+    setCache(key, result);
+  } else {
+    console.log(`[subtitle] list not cached (alignment pending/incomplete)`);
+  }
 
   res.json(result);
 });
+
+/** Re-download each subtitle, apply offset, cache aligned SRT under /alignedsub/. */
+async function applyOffsetToSubtitles(subs: Subtitle[], offset: number): Promise<Subtitle[]> {
+  return Promise.all(
+    subs.map(async (sub) => {
+      const format = (sub._format || 'srt') as SubtitleFormat | null;
+      if (!format) return sub;
+      try {
+        const realUrl = resolveRealUrl(sub.url);
+        const subContent = await fetchText(realUrl);
+        if (!subContent) return sub;
+
+        let adjustedContent: string | null = null;
+        if (format === 'ass') {
+          // Nuvio Android cannot parse ASS (ICU regex crash on unescaped }).
+          // Convert to SRT after offsetting.
+          const entries = parseSubtitle(subContent, 'ass');
+          if (entries.length > 0) {
+            adjustedContent = reSerialize(adjustEntries(entries, offset), 'srt');
+          }
+        } else {
+          // SRT/VTT: parse → adjust → re-serialize
+          const entries = parseSubtitle(subContent, format);
+          if (entries.length > 0) {
+            const adjusted = adjustEntries(entries, offset);
+            adjustedContent = reSerialize(adjusted, format === 'vtt' ? 'srt' : format);
+          }
+        }
+
+        if (adjustedContent) {
+          const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+          alignedSubCache.set(
+            token,
+            {
+              body: Buffer.from(adjustedContent, 'utf-8'),
+              contentType: 'text/plain; charset=utf-8',
+            },
+            ALIGNED_SUB_TTL_MS,
+          );
+          return {
+            ...sub,
+            url: `aligned:${token}`,
+            _aligned: true,
+          };
+        }
+      } catch (e: any) {
+        console.log(`[subtitle] apply offset failed for one sub: ${e.message?.substring(0, 120)}`);
+      }
+      return sub;
+    }),
+  );
+}
 
 // ── Aligned subtitle content endpoint ──────────────────────────────
 // Serves offset-applied SRT bodies stored during the /subtitles response.

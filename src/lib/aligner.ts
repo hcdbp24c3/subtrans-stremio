@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { exec, execSync } from 'child_process';
 import { writeFileSync, existsSync, readFileSync, unlinkSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -8,6 +8,24 @@ import { SubtitleEntry } from './subtitle-parser.js';
 const OFFSET_THRESHOLD = 0.5;
 const MAX_OFFSET = 600;
 const TEXT_SIMILARITY_MIN = 0.6;
+
+/** Run a shell command without blocking the Node event loop. */
+function execAsync(
+  cmd: string,
+  timeoutMs: number,
+  maxBuffer = 4 * 1024 * 1024,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    exec(
+      cmd,
+      { encoding: 'utf-8', timeout: timeoutMs, maxBuffer },
+      (err, stdout) => {
+        if (err) reject(err);
+        else resolve(stdout);
+      },
+    );
+  });
+}
 
 // ── Text normalization ────────────────────────────────────────────
 function normalizeText(text: string): string {
@@ -83,13 +101,23 @@ function resolveRedirect(url: string): string {
   } catch { return url; }
 }
 
+async function resolveRedirectAsync(url: string): Promise<string> {
+  try {
+    const location = (await execAsync(
+      `curl -sI --max-time 10 "${url}" 2>/dev/null | grep -i "^location:" | tail -1 | tr -d '\\r' | awk '{print $2}'`,
+      15000,
+    )).trim();
+    return location || url;
+  } catch { return url; }
+}
+
 export async function getVideoDuration(url: string): Promise<number | null> {
   try {
-    const probeUrl = resolveRedirect(url);
-    const result = execSync(
+    const probeUrl = await resolveRedirectAsync(url);
+    const result = (await execAsync(
       `ffprobe -v error -show_entries format=duration -analyzeduration 5000000 -probesize 1000000 "${probeUrl}" 2>/dev/null`,
-      { encoding: 'utf-8', timeout: 30000 },
-    ).trim();
+      30000,
+    )).trim();
     const match = result.match(/duration=([\d.]+)/);
     return match ? parseFloat(match[1]) : null;
   } catch { return null; }
@@ -121,6 +149,31 @@ export function parseDurationFromProbeLine(line: string): number | null {
  * Resolves redirects once, then runs a single ffprobe with both requests.
  * This cuts the two sequential ffprobe calls (30s each) down to one.
  */
+function parseProbeOutput(result: string): VideoProbeResult {
+  const textCodecs = ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'mov_text'];
+  const subtitleStreams: SubtitleStreamInfo[] = [];
+  let duration: number | null = null;
+
+  for (const line of result.split('\n')) {
+    const parts = line.split(',');
+    if (parts.length >= 3 && parts[2].trim() === 'subtitle') {
+      const codec = parts[1].trim().toLowerCase();
+      if (textCodecs.includes(codec)) {
+        subtitleStreams.push({
+          index: parseInt(parts[0]),
+          codec,
+          lang: (parts[3] || 'und').trim(),
+          title: (parts[4] || '').trim(),
+        });
+      }
+    }
+    const d = parseDurationFromProbeLine(line);
+    if (d !== null) duration = d;
+  }
+
+  return { duration, subtitleStreams };
+}
+
 export function probeVideoInfo(url: string): VideoProbeResult {
   const probeUrl = resolveRedirect(url);
   try {
@@ -128,29 +181,21 @@ export function probeVideoInfo(url: string): VideoProbeResult {
       `ffprobe -v error -show_entries stream=index,codec_name,codec_type:stream_tags=language,title -show_entries format=duration -of csv=p=0 "${probeUrl}" 2>/dev/null`,
       { encoding: 'utf-8', timeout: 30000 },
     ).trim();
+    return parseProbeOutput(result);
+  } catch {
+    return { duration: null, subtitleStreams: [] };
+  }
+}
 
-    const textCodecs = ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'mov_text'];
-    const subtitleStreams: SubtitleStreamInfo[] = [];
-    let duration: number | null = null;
-
-    for (const line of result.split('\n')) {
-      const parts = line.split(',');
-      if (parts.length >= 3 && parts[2].trim() === 'subtitle') {
-        const codec = parts[1].trim().toLowerCase();
-        if (textCodecs.includes(codec)) {
-          subtitleStreams.push({
-            index: parseInt(parts[0]),
-            codec,
-            lang: (parts[3] || 'und').trim(),
-            title: (parts[4] || '').trim(),
-          });
-        }
-      }
-      const d = parseDurationFromProbeLine(line);
-      if (d !== null) duration = d;
-    }
-
-    return { duration, subtitleStreams };
+/** Non-blocking ffprobe — safe to run after the HTTP response is sent. */
+export async function probeVideoInfoAsync(url: string): Promise<VideoProbeResult> {
+  try {
+    const probeUrl = await resolveRedirectAsync(url);
+    const result = (await execAsync(
+      `ffprobe -v error -show_entries stream=index,codec_name,codec_type:stream_tags=language,title -show_entries format=duration -of csv=p=0 "${probeUrl}" 2>/dev/null`,
+      30000,
+    )).trim();
+    return parseProbeOutput(result);
   } catch {
     return { duration: null, subtitleStreams: [] };
   }
@@ -204,13 +249,17 @@ export function findBestRefSubtitleStream(videoUrl: string): SubtitleStreamInfo 
  * Extract a subtitle track from a video URL as SRT content.
  * Uses timeout — for large files, partial extraction is OK for alignment.
  */
-export function extractBuiltinSubtitle(videoUrl: string, streamIndex: number, timeoutSec = 60): string | null {
+export async function extractBuiltinSubtitle(
+  videoUrl: string,
+  streamIndex: number,
+  timeoutSec = 60,
+): Promise<string | null> {
   const tmpFile = join(tmpdir(), `builtin_sub_${streamIndex}_${Date.now()}.srt`);
   try {
     console.log(`[aligner] Extracting builtin sub stream ${streamIndex} (timeout ${timeoutSec}s)...`);
-    execSync(
+    await execAsync(
       `timeout ${timeoutSec} ffmpeg -y -probesize 32 -analyzeduration 0 -i "${videoUrl}" -map 0:${streamIndex} -c:s srt -f srt "${tmpFile}" 2>/dev/null`,
-      { encoding: 'utf-8', timeout: (timeoutSec + 10) * 1000 },
+      (timeoutSec + 10) * 1000,
     );
     if (existsSync(tmpFile)) {
       const content = readFileSync(tmpFile, 'utf-8');
@@ -270,7 +319,8 @@ export function parseFfsubsyncOutput(output: string): { offset: number; score: n
   };
 }
 
-/** Parse JSON last-line from the Python bridge. Returns null if unusable. */
+/** Parse JSON last-line from the Python bridge. Returns null if unusable.
+ *  ok=true with offset=0 is a valid "already synced" result (not a failure). */
 export function parseFfsubsyncBridgeJson(output: string): { offset: number; score: number } | null {
   const lines = output.trim().split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -278,7 +328,7 @@ export function parseFfsubsyncBridgeJson(output: string): { offset: number; scor
     if (!line.startsWith('{')) continue;
     try {
       const j = JSON.parse(line) as { offset?: number; score?: number; ok?: boolean };
-      if (j.ok && typeof j.offset === 'number' && j.offset !== 0) {
+      if (j.ok && typeof j.offset === 'number') {
         return { offset: j.offset, score: typeof j.score === 'number' ? j.score : 0 };
       }
       return null; // valid JSON but not ok → stop
@@ -292,43 +342,51 @@ export function countSrtEntries(content: string): number {
   return (content.match(/^\d+$/gm) || []).length;
 }
 
+export interface BridgeRunResult {
+  /** Effective offset after confidence gate (0 when low confidence / failure). */
+  offset: number;
+  /** True when the bridge completed with score > 0 (result is cacheable). */
+  ok: boolean;
+}
+
 /**
- * Run the Python library bridge (`ffsubsync.run`) instead of the CLI.
- * Returns 0 when unavailable / no offset / low confidence.
+ * Run the Python library bridge (`ffsubsync.run`) without blocking the event loop.
+ * ok=false → failure / low confidence (try next cascade step).
+ * ok=true  → definitive answer, including offset=0 (already synced).
  */
-function runFfsubsyncBridge(args: string[], label: string, timeoutMs = 30000): number {
+async function runFfsubsyncBridge(args: string[], label: string, timeoutMs = 30000): Promise<BridgeRunResult> {
   const script = resolveFfsubsyncBridge();
   try {
     const quoted = args.map((a) => `"${a.replace(/"/g, '\\"')}"`).join(' ');
-    const result = execSync(
+    const result = await execAsync(
       `python3 "${script}" ${quoted} 2>/dev/null`,
-      { encoding: 'utf-8', timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
+      timeoutMs,
     );
     const parsed = parseFfsubsyncBridgeJson(result);
     if (!parsed) {
       console.log(`[aligner] ffsubsync(${label}): no usable offset from bridge`);
-      return 0;
+      return { offset: 0, ok: false };
     }
-    console.log(`[aligner] ffsubsync(${label}): offset=${parsed.offset.toFixed(3)}s, score=${parsed.score}`);
     if (parsed.score <= 0) {
       console.log(`[aligner] ffsubsync(${label}): low confidence (score<=0), ignoring offset`);
-      return 0;
+      return { offset: 0, ok: false };
     }
-    return parsed.offset;
+    console.log(`[aligner] ffsubsync(${label}): offset=${parsed.offset.toFixed(3)}s, score=${parsed.score}`);
+    return { offset: parsed.offset, ok: true };
   } catch (e: any) {
     console.log(`[aligner] ffsubsync(${label}) failed: ${e.message?.substring(0, 200)}`);
-    return 0;
+    return { offset: 0, ok: false };
   }
 }
 
 /**
  * Sync target against a local reference (SRT or WAV) via the library bridge.
  */
-function runFfsubsyncLocal(refPath: string, targetSubContent: string, label: string): number {
+async function runFfsubsyncLocal(refPath: string, targetSubContent: string, label: string): Promise<BridgeRunResult> {
   const targetFile = join(tmpdir(), `ffs_target_${Date.now()}.srt`);
   try {
     writeFileSync(targetFile, targetSubContent, 'utf-8');
-    return runFfsubsyncBridge(['sub-to-sub', refPath, targetFile], label, 30000);
+    return await runFfsubsyncBridge(['sub-to-sub', refPath, targetFile], label, 30000);
   } finally {
     try { unlinkSync(targetFile); } catch {}
   }
@@ -338,12 +396,12 @@ function runFfsubsyncLocal(refPath: string, targetSubContent: string, label: str
  * Extract a bounded local audio sample (mono 16 kHz WAV) from a video URL.
  * Partial file on timeout is accepted if large enough for ffsubsync.
  */
-export function extractAudioSample(videoUrl: string, seconds = 180, timeoutSec = 45): string | null {
+export async function extractAudioSample(videoUrl: string, seconds = 180, timeoutSec = 45): Promise<string | null> {
   const tmpFile = join(tmpdir(), `audio_sample_${Date.now()}.wav`);
   const cmd = `timeout ${timeoutSec} ffmpeg -y -i "${videoUrl}" -t ${seconds} -vn -ac 1 -ar 16000 -c:a pcm_s16le "${tmpFile}" 2>/dev/null`;
   try {
     console.log(`[aligner] Extracting ${seconds}s audio sample (timeout ${timeoutSec}s)...`);
-    execSync(cmd, { encoding: 'utf-8', timeout: (timeoutSec + 5) * 1000 });
+    await execAsync(cmd, (timeoutSec + 5) * 1000);
   } catch {
     // timeout(1) leaves a partial WAV — recover if usable
     if (existsSync(tmpFile)) {
@@ -380,11 +438,14 @@ export function extractAudioSample(videoUrl: string, seconds = 180, timeoutSec =
  * on large remote REMUXes; copies only the first 60s of audio).
  * Works when the video has no text builtin subs (PGS-only remuxes).
  */
-export function calculateOffsetWithFfsubsyncVideo(videoUrl: string, targetSubContent: string): number {
+export async function calculateOffsetWithFfsubsyncVideo(
+  videoUrl: string,
+  targetSubContent: string,
+): Promise<BridgeRunResult> {
   const targetFile = join(tmpdir(), `ffs_target_${Date.now()}.srt`);
   try {
     writeFileSync(targetFile, targetSubContent, 'utf-8');
-    return runFfsubsyncBridge(
+    return await runFfsubsyncBridge(
       ['video', videoUrl, targetFile, '--fast'],
       'video-fast',
       60000,
@@ -399,6 +460,8 @@ export type OffsetMethod = 'builtin-sub' | 'audio-sample' | 'video-remote';
 export interface SmartOffsetResult {
   offset: number;
   method: OffsetMethod;
+  /** True when alignment finished with a definitive answer (including offset=0). */
+  completed: boolean;
 }
 
 /**
@@ -406,22 +469,25 @@ export interface SmartOffsetResult {
  *  1. Builtin text sub extract → library sub-to-sub (~30s extract + ~1s sync)
  *  2. Library video --fast (extract-audio-first 60s → ~35s total)
  *  3. Bounded local audio sample → library sub-to-sub (fallback)
+ *
+ * Does not block the event loop. completed=false means every step failed
+ * (do not cache). completed=true with offset=0 means "already synced" (cache).
  */
-export function calculateOffsetSmart(
+export async function calculateOffsetSmart(
   videoUrl: string,
   targetSubContent: string,
   textStreams: SubtitleStreamInfo[] = [],
-): SmartOffsetResult {
+): Promise<SmartOffsetResult> {
   // 1) Builtin text subtitle reference (fastest reliable path)
   const eng = textStreams.find((s) => s.lang.startsWith('eng') || s.lang === 'en')
     ?? textStreams[0];
   if (eng) {
-    const refSrt = extractBuiltinSubtitle(videoUrl, eng.index, 30);
+    const refSrt = await extractBuiltinSubtitle(videoUrl, eng.index, 30);
     if (refSrt && countSrtEntries(refSrt) >= 3) {
       const refPath = writeTempSrt(refSrt, `ref_${eng.index}`);
       try {
-        const offset = runFfsubsyncLocal(refPath, targetSubContent, `builtin-sub#${eng.index}`);
-        if (offset !== 0) return { offset, method: 'builtin-sub' };
+        const result = await runFfsubsyncLocal(refPath, targetSubContent, `builtin-sub#${eng.index}`);
+        if (result.ok) return { offset: result.offset, method: 'builtin-sub', completed: true };
       } finally {
         try { unlinkSync(refPath); } catch {}
       }
@@ -429,21 +495,21 @@ export function calculateOffsetSmart(
   }
 
   // 2) Library video path with --fast (extract-audio-first, bounded)
-  const videoOffset = calculateOffsetWithFfsubsyncVideo(videoUrl, targetSubContent);
-  if (videoOffset !== 0) return { offset: videoOffset, method: 'video-remote' };
+  const videoResult = await calculateOffsetWithFfsubsyncVideo(videoUrl, targetSubContent);
+  if (videoResult.ok) return { offset: videoResult.offset, method: 'video-remote', completed: true };
 
   // 3) Local audio sample + library sub-to-sub (works for PGS-only remuxes)
-  const wavPath = extractAudioSample(videoUrl, 180, 45);
+  const wavPath = await extractAudioSample(videoUrl, 180, 45);
   if (wavPath) {
     try {
-      const offset = runFfsubsyncLocal(wavPath, targetSubContent, 'audio-sample');
-      if (offset !== 0) return { offset, method: 'audio-sample' };
+      const result = await runFfsubsyncLocal(wavPath, targetSubContent, 'audio-sample');
+      if (result.ok) return { offset: result.offset, method: 'audio-sample', completed: true };
     } finally {
       try { unlinkSync(wavPath); } catch {}
     }
   }
 
-  return { offset: 0, method: 'video-remote' };
+  return { offset: 0, method: 'video-remote', completed: false };
 }
 
 function writeTempSrt(content: string, prefix: string): string {
@@ -456,11 +522,14 @@ function writeTempSrt(content: string, prefix: string): string {
  * Calculate subtitle sync offset using the ffsubsync library bridge (sub-to-sub).
  * Prefer calculateOffsetSmart when a video URL is available.
  */
-export function calculateOffsetWithFfsubsync(referenceSrtContent: string, targetSrtContent: string): number {
+export async function calculateOffsetWithFfsubsync(
+  referenceSrtContent: string,
+  targetSrtContent: string,
+): Promise<BridgeRunResult> {
   const refFile = join(tmpdir(), `ffs_ref_${Date.now()}.srt`);
   try {
     writeFileSync(refFile, referenceSrtContent);
-    return runFfsubsyncLocal(refFile, targetSrtContent, 'sub-to-sub');
+    return await runFfsubsyncLocal(refFile, targetSrtContent, 'sub-to-sub');
   } finally {
     try { unlinkSync(refFile); } catch {}
   }

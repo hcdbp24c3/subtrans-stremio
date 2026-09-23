@@ -29,8 +29,9 @@ describe('parseFfsubsyncBridgeJson', () => {
     expect(parseFfsubsyncBridgeJson('{"offset": 0, "score": 0, "ok": false}')).toBeNull();
   });
 
-  it('returns null when offset is 0', () => {
-    expect(parseFfsubsyncBridgeJson('{"offset": 0, "score": 100, "ok": true}')).toBeNull();
+  it('returns offset 0 when ok=true (already synced — cacheable)', () => {
+    expect(parseFfsubsyncBridgeJson('{"offset": 0, "score": 100, "ok": true}'))
+      .toEqual({ offset: 0, score: 100 });
   });
 
   it('returns null when no JSON line', () => {
