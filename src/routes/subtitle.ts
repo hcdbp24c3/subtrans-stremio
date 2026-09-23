@@ -1,12 +1,15 @@
 import { Router } from 'express';
 import { decodeConfig, encodeConfig, AddonConfig } from '../config.js';
 import { fetchJson, fetchText } from '../lib/proxy.js';
-import { detectFormat, parseSubtitle, SubtitleFormat } from '../lib/subtitle-parser.js';
+import {
+  detectFormat, sniffFormat, parseSubtitle, SubtitleFormat
+} from '../lib/subtitle-parser.js';
 import {
   calculateOffsetWithFfsubsyncVideo, adjustEntries,
   isFfsubsyncAvailable,
   probeVideoInfo, VideoProbeResult,
 } from '../lib/aligner.js';
+import { detectFileExt } from './subtitle-ext.js';
 import { createTtlStore } from '../lib/ttl-store.js';
 
 const router = Router();
@@ -90,18 +93,6 @@ function setCache(key: string, data: { subtitles: Subtitle[] }): void {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
-
-/** Detect file extension from upstream URL for Nuvio format detection */
-function detectFileExt(url: string): string {
-  // Check for known extensions in the URL path (not query params)
-  try {
-    const pathname = new URL(url).pathname.toLowerCase();
-    if (pathname.endsWith('.vtt') || pathname.includes('.vtt?')) return '.vtt';
-    if (pathname.endsWith('.ass') || pathname.endsWith('.ssa') || pathname.includes('.ass?') || pathname.includes('.ssa?')) return '.ass';
-  } catch {}
-  // Default to .srt (most common subtitle format)
-  return '.srt';
-}
 
 /** Extract real download URL from SubSense local proxy URLs */
 function resolveRealUrl(url: string): string {
@@ -336,14 +327,18 @@ router.get('/subtitles/:type/*', async (req, res) => {
           let adjustedContent: string | null = null;
 
           if (format === 'ass') {
-            // ASS/SSA: adjust timestamps in-place on raw text (preserves styling)
-            adjustedContent = adjustAssTimestamps(subContent, offset);
+            // Nuvio Android cannot parse ASS (ICU regex crash on unescaped }).
+            // Convert to SRT after offsetting so the data URL is always SRT.
+            const entries = parseSubtitle(subContent, 'ass');
+            if (entries.length > 0) {
+              adjustedContent = reSerialize(adjustEntries(entries, offset), 'srt');
+            }
           } else {
             // SRT/VTT: parse → adjust → re-serialize
             const entries = parseSubtitle(subContent, format);
             if (entries.length > 0) {
               const adjusted = adjustEntries(entries, offset);
-              adjustedContent = reSerialize(adjusted, format);
+              adjustedContent = reSerialize(adjusted, format === 'vtt' ? 'srt' : format);
             }
           }
 
@@ -384,7 +379,8 @@ router.get('/subtitles/:type/*', async (req, res) => {
 // Upstream addons (SubSense) return 127.0.0.1 URLs that only work locally.
 // This endpoint proxies the download so Nuvio/browser can fetch it.
 // URL format: /subdownload.srt?url=...&config=...
-// The .srt/.vtt/.ass extension helps Nuvio detect subtitle format.
+// Extension is .srt/.vtt only — never .ass (Nuvio Android ICU regex crash).
+// ASS upstream content is converted to SRT on the fly.
 async function handleSubDownload(req: any, res: any) {
   const url = req.query.url as string;
   if (!url) {
@@ -451,8 +447,10 @@ async function handleSubDownload(req: any, res: any) {
       const buffer = Buffer.concat(chunks);
       const rawContent = buffer.toString('utf-8').replace(/^\uFEFF/, '');
 
-      // Stremio only supports SRT/VTT — convert ASS/SSA to SRT on the fly
-      const upstreamFormat = detectFormat(url) || ((ext === 'ass' || ext === 'ssa') ? 'ass' : null);
+      // Detect by CONTENT first (OpenSubtitles often has no extension).
+      // Always convert ASS→SRT: Nuvio Android ICU crashes on ASS parser.
+      const extHint = (ext === 'ass' || ext === 'ssa') ? 'ass' : ext;
+      const upstreamFormat = sniffFormat(rawContent, extHint);
       let finalContent = rawContent;
       let finalContentType = mimeMap[ext] || 'text/plain; charset=utf-8';
       if (upstreamFormat === 'ass') {
@@ -511,7 +509,7 @@ function reSerialize(
     return `WEBVTT\n\n${body}`;
   }
 
-  // ASS/SSA: handled separately via adjustAssTimestamps
+  // ASS/SSA content is converted to SRT in handleSubDownload (Nuvio ICU-safe)
   return null;
 }
 

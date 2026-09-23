@@ -14,6 +14,21 @@ export function detectFormat(filename: string): SubtitleFormat | null {
   return null;
 }
 
+/**
+ * Detect format from content first, then extension hint.
+ * OpenSubtitles URLs often lack a file extension — sniff [Script Info]/Dialogue
+ * so ASS is never mistaken for SRT (Nuvio's Android ICU regex crashes on ASS).
+ */
+export function sniffFormat(content: string, extHint?: string | null): SubtitleFormat | null {
+  const head = content.replace(/^﻿/, '').slice(0, 1024);
+  if (head.includes('[Script Info]') || /^\s*Dialogue:/m.test(content)) return 'ass';
+  if (head.startsWith('WEBVTT')) return 'vtt';
+  if (extHint === 'ass' || extHint === 'ssa') return 'ass';
+  if (extHint === 'srt' || extHint === 'vtt') return extHint;
+  if (content.includes('-->')) return 'srt';
+  return null;
+}
+
 export function parseSrtTime(time: string): number {
   const match = time.trim().match(/(\d{2}):(\d{2}):(\d{2})[,.](\d{3})/);
   if (!match) return 0;
