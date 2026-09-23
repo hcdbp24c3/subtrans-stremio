@@ -27,6 +27,11 @@
     }
     h1 { text-align: center; margin-bottom: 6px; color: #e94560; font-size: 22px; }
     .subtitle { text-align: center; color: #888; margin-bottom: 24px; font-size: 13px; }
+    .badge {
+      display: none; text-align: center; margin: -12px 0 16px;
+      font-size: 12px; color: #4ecca3;
+    }
+    .badge.show { display: block; }
 
     /* Tabs */
     .tabs { display: flex; gap: 0; margin-bottom: 24px; border-bottom: 2px solid #0f3460; }
@@ -62,30 +67,92 @@
     .btn-add {
       background: transparent; color: #4ecca3; border: 2px dashed #4ecca3;
       border-radius: 8px; padding: 10px; font-size: 14px; cursor: pointer;
-      font-weight: 600; width: 100%;
+      font-weight: 600; width: 100%; margin-top: 10px;
     }
     .btn-add:hover { background: rgba(78,204,163,0.1); }
 
-    /* Language section */
-    .lang-section { margin-top: 24px; }
-    .lang-section label { display: block; margin-bottom: 8px; font-weight: 600; color: #ccc; font-size: 14px; }
-    .lang-grid { display: flex; flex-wrap: wrap; gap: 6px; }
-    .lang-chip {
-      padding: 6px 12px; border-radius: 20px; font-size: 12px; cursor: pointer;
-      border: 1px solid #333; background: #0f3460; color: #ccc;
-      transition: all 0.2s; user-select: none;
+    /* Language multi-select dropdown */
+    .lang-section { margin-top: 24px; position: relative; }
+    .lang-section > label { display: block; margin-bottom: 8px; font-weight: 600; color: #ccc; font-size: 14px; }
+    .lang-select {
+      position: relative; background: #0f3460; border: 1px solid #333;
+      border-radius: 8px; min-height: 44px;
     }
-    .lang-chip:hover { border-color: #e94560; }
-    .lang-chip.selected { background: #e94560; color: white; border-color: #e94560; }
+    .lang-select.open { border-color: #e94560; }
+    .lang-control {
+      display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+      padding: 8px 36px 8px 10px; cursor: pointer; min-height: 44px;
+      position: relative;
+    }
+    .lang-placeholder { color: #666; font-size: 13px; }
+    .lang-caret {
+      position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
+      color: #888; pointer-events: none; font-size: 12px;
+    }
+    .lang-tag {
+      display: inline-flex; align-items: center; gap: 4px;
+      background: #e94560; color: #fff; border-radius: 14px;
+      padding: 3px 8px 3px 10px; font-size: 12px; line-height: 1.3;
+    }
+    .lang-tag button {
+      background: transparent; border: none; color: #fff;
+      cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px;
+      opacity: 0.8;
+    }
+    .lang-tag button:hover { opacity: 1; }
+    .lang-dropdown {
+      display: none; position: absolute; left: 0; right: 0; top: calc(100% + 4px);
+      background: #16213e; border: 1px solid #0f3460; border-radius: 8px;
+      z-index: 50; box-shadow: 0 8px 24px rgba(0,0,0,0.4); overflow: hidden;
+    }
+    .lang-select.open .lang-dropdown { display: block; }
+    .lang-search {
+      width: 100%; padding: 10px 12px; border: none; border-bottom: 1px solid #0f3460;
+      background: #0f3460; color: #eee; font-size: 13px; outline: none;
+    }
+    .lang-search::placeholder { color: #666; }
+    .lang-options { max-height: 260px; overflow-y: auto; padding: 6px 0; }
+    .lang-opt {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 12px; cursor: pointer; font-size: 13px; color: #ccc;
+    }
+    .lang-opt:hover { background: #0f3460; }
+    .lang-opt input { accent-color: #e94560; cursor: pointer; }
+    .lang-opt .code { color: #666; font-size: 11px; margin-left: auto; font-family: monospace; }
+    .lang-opt.selected { color: #eee; }
+    .lang-actions {
+      display: flex; gap: 8px; padding: 8px 12px; border-top: 1px solid #0f3460;
+      background: #0f3460;
+    }
+    .lang-actions button {
+      flex: 1; padding: 6px; border-radius: 4px; border: 1px solid #333;
+      background: #16213e; color: #ccc; font-size: 12px; cursor: pointer;
+    }
+    .lang-actions button:hover { border-color: #e94560; color: #eee; }
     .lang-hint { font-size: 11px; color: #666; margin-top: 8px; }
 
-    /* Generate button */
+    /* Generate + open buttons */
     .btn-generate {
       width: 100%; padding: 14px; background: #e94560; color: white; border: none;
       border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer;
       margin-top: 24px;
     }
     .btn-generate:hover { background: #c73650; }
+
+    .open-row {
+      display: none; gap: 10px; margin-top: 12px;
+    }
+    .open-row.show { display: flex; }
+    .btn-open {
+      flex: 1; padding: 12px 10px; border: none; border-radius: 8px;
+      font-size: 14px; font-weight: 600; cursor: pointer; color: #fff;
+      text-decoration: none; text-align: center;
+    }
+    .btn-open:disabled, .btn-open.disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn-stremio { background: #1c75bc; }
+    .btn-stremio:hover:not(.disabled) { background: #155e99; }
+    .btn-stremio-web { background: #2d6cdf; }
+    .btn-stremio-web:hover:not(.disabled) { background: #2258b5; }
 
     /* Result */
     .result { margin-top: 20px; padding: 16px; background: #0f3460; border-radius: 8px; display: none; }
@@ -110,7 +177,8 @@
 <body>
   <div class="container">
     <h1>🎬 Subtitle Alignment</h1>
-    <p class="subtitle">Auto-align subtitles with video using ffprobe</p>
+    <p class="subtitle">Auto-align subtitles with video using ffsubsync</p>
+    <div class="badge" id="reconfigBadge">✓ Loaded existing config from URL — edit &amp; regenerate</div>
 
     <div class="tabs">
       <div class="tab active" data-tab="stream" onclick="switchTab('stream')">🎬 Stream Addons</div>
@@ -128,12 +196,35 @@
     </div>
 
     <div class="lang-section">
-      <label>Languages</label>
-      <div class="lang-grid" id="langGrid"></div>
-      <div class="lang-hint">Click to select languages. No selection = all languages. Max 5 subs per language.</div>
+      <label for="langSearch">Languages</label>
+      <div class="lang-select" id="langSelect">
+        <div class="lang-control" id="langControl" onclick="toggleLangDropdown(event)">
+          <span class="lang-placeholder" id="langPlaceholder">All languages (click to choose)</span>
+        </div>
+        <span class="lang-caret">▼</span>
+        <div class="lang-dropdown" id="langDropdown" onclick="event.stopPropagation()">
+          <input class="lang-search" id="langSearch" type="text" placeholder="Search languages… (English, code)"
+                 autocomplete="off" oninput="filterLangs()" onkeydown="onLangSearchKey(event)">
+          <div class="lang-options" id="langOptions"></div>
+          <div class="lang-actions">
+            <button type="button" onclick="clearLangs()">Clear all</button>
+            <button type="button" onclick="closeLangDropdown()">Done</button>
+          </div>
+        </div>
+      </div>
+      <div class="lang-hint">Search &amp; multi-select. Empty = all languages. Max 5 subs per language.</div>
     </div>
 
     <button class="btn-generate" onclick="generate()">Generate Manifest URL</button>
+
+    <div class="open-row" id="openRow">
+      <button type="button" class="btn-open btn-stremio" id="btnStremio" onclick="openInStremio()" title="Open install page in Stremio desktop app">
+        📺 Open in Stremio
+      </button>
+      <button type="button" class="btn-open btn-stremio-web" id="btnStremioWeb" onclick="openInStremioWeb()" title="Install in Stremio Web">
+        🌐 Stremio Web
+      </button>
+    </div>
 
     <div class="result" id="result">
       <strong>Your Manifest URL:</strong>
@@ -141,67 +232,357 @@
       <button class="btn-copy" onclick="copyUrl()">Copy URL</button>
       <div class="install-section">
         <strong>Install in Stremio:</strong><br>
-        Open Stremio → Add-ons → Community Addons → Paste the URL above
+        Use the buttons above, or open Stremio → Add-ons → Community Addons → paste the URL.<br>
+        Re-edit later: open <code>/configure?config=…</code> with this config.
       </div>
     </div>
   </div>
 
   <script>
-    // ── Language data ──────────────────────────────────────────
+    // ── Full world languages (ISO 639-1 + common names) ────────
     const LANGUAGES = [
+      { code: 'aa', label: 'Afar' },
+      { code: 'ab', label: 'Abkhazian' },
+      { code: 'ae', label: 'Avestan' },
+      { code: 'af', label: 'Afrikaans' },
+      { code: 'ak', label: 'Akan' },
+      { code: 'am', label: 'Amharic' },
+      { code: 'an', label: 'Aragonese' },
+      { code: 'ar', label: 'Arabic' },
+      { code: 'as', label: 'Assamese' },
+      { code: 'av', label: 'Avaric' },
+      { code: 'ay', label: 'Aymara' },
+      { code: 'az', label: 'Azerbaijani' },
+      { code: 'ba', label: 'Bashkir' },
+      { code: 'be', label: 'Belarusian' },
+      { code: 'bg', label: 'Bulgarian' },
+      { code: 'bh', label: 'Bihari' },
+      { code: 'bi', label: 'Bislama' },
+      { code: 'bm', label: 'Bambara' },
+      { code: 'bn', label: 'Bengali' },
+      { code: 'bo', label: 'Tibetan' },
+      { code: 'br', label: 'Breton' },
+      { code: 'bs', label: 'Bosnian' },
+      { code: 'ca', label: 'Catalan' },
+      { code: 'ce', label: 'Chechen' },
+      { code: 'ch', label: 'Chamorro' },
+      { code: 'co', label: 'Corsican' },
+      { code: 'cr', label: 'Cree' },
+      { code: 'cs', label: 'Czech' },
+      { code: 'cu', label: 'Church Slavic' },
+      { code: 'cv', label: 'Chuvash' },
+      { code: 'cy', label: 'Welsh' },
+      { code: 'da', label: 'Danish' },
+      { code: 'de', label: 'German' },
+      { code: 'dv', label: 'Divehi' },
+      { code: 'dz', label: 'Dzongkha' },
+      { code: 'ee', label: 'Ewe' },
+      { code: 'el', label: 'Greek' },
       { code: 'en', label: 'English' },
-      { code: 'vi', label: 'Tiếng Việt' },
-      { code: 'ja', label: '日本語' },
-      { code: 'ko', label: '한국어' },
-      { code: 'zh', label: '中文' },
-      { code: 'th', label: 'ไทย' },
-      { code: 'id', label: 'Bahasa Indonesia' },
-      { code: 'ms', label: 'Bahasa Melayu' },
-      { code: 'fr', label: 'Français' },
-      { code: 'de', label: 'Deutsch' },
-      { code: 'es', label: 'Español' },
-      { code: 'pt', label: 'Português' },
-      { code: 'it', label: 'Italiano' },
-      { code: 'ru', label: 'Русский' },
-      { code: 'ar', label: 'العربية' },
-      { code: 'hi', label: 'हिन्दी' },
-      { code: 'tr', label: 'Türkçe' },
-      { code: 'pl', label: 'Polski' },
-      { code: 'nl', label: 'Nederlands' },
-      { code: 'sv', label: 'Svenska' },
-      { code: 'da', label: 'Dansk' },
-      { code: 'no', label: 'Norsk' },
-      { code: 'fi', label: 'Suomi' },
-      { code: 'uk', label: 'Українська' },
-      { code: 'cs', label: 'Čeština' },
-      { code: 'el', label: 'Ελληνικά' },
-      { code: 'ro', label: 'Română' },
-      { code: 'hu', label: 'Magyar' },
-      { code: 'he', label: 'עברית' },
-    ];
+      { code: 'eo', label: 'Esperanto' },
+      { code: 'es', label: 'Spanish' },
+      { code: 'et', label: 'Estonian' },
+      { code: 'eu', label: 'Basque' },
+      { code: 'fa', label: 'Persian' },
+      { code: 'ff', label: 'Fulah' },
+      { code: 'fi', label: 'Finnish' },
+      { code: 'fj', label: 'Fijian' },
+      { code: 'fo', label: 'Faroese' },
+      { code: 'fr', label: 'French' },
+      { code: 'fy', label: 'Western Frisian' },
+      { code: 'ga', label: 'Irish' },
+      { code: 'gd', label: 'Scottish Gaelic' },
+      { code: 'gl', label: 'Galician' },
+      { code: 'gn', label: 'Guarani' },
+      { code: 'gu', label: 'Gujarati' },
+      { code: 'gv', label: 'Manx' },
+      { code: 'ha', label: 'Hausa' },
+      { code: 'he', label: 'Hebrew' },
+      { code: 'hi', label: 'Hindi' },
+      { code: 'ho', label: 'Hiri Motu' },
+      { code: 'hr', label: 'Croatian' },
+      { code: 'ht', label: 'Haitian Creole' },
+      { code: 'hu', label: 'Hungarian' },
+      { code: 'hy', label: 'Armenian' },
+      { code: 'hz', label: 'Herero' },
+      { code: 'ia', label: 'Interlingua' },
+      { code: 'id', label: 'Indonesian' },
+      { code: 'ie', label: 'Interlingue' },
+      { code: 'ig', label: 'Igbo' },
+      { code: 'ii', label: 'Sichuan Yi' },
+      { code: 'ik', label: 'Inupiaq' },
+      { code: 'io', label: 'Ido' },
+      { code: 'is', label: 'Icelandic' },
+      { code: 'it', label: 'Italian' },
+      { code: 'iu', label: 'Inuktitut' },
+      { code: 'ja', label: 'Japanese' },
+      { code: 'jv', label: 'Javanese' },
+      { code: 'ka', label: 'Georgian' },
+      { code: 'kg', label: 'Kongo' },
+      { code: 'ki', label: 'Kikuyu' },
+      { code: 'kj', label: 'Kuanyama' },
+      { code: 'kk', label: 'Kazakh' },
+      { code: 'kl', label: 'Kalaallisut' },
+      { code: 'km', label: 'Khmer' },
+      { code: 'kn', label: 'Kannada' },
+      { code: 'ko', label: 'Korean' },
+      { code: 'kr', label: 'Kanuri' },
+      { code: 'ks', label: 'Kashmiri' },
+      { code: 'ku', label: 'Kurdish' },
+      { code: 'kv', label: 'Komi' },
+      { code: 'kw', label: 'Cornish' },
+      { code: 'ky', label: 'Kyrgyz' },
+      { code: 'la', label: 'Latin' },
+      { code: 'lb', label: 'Luxembourgish' },
+      { code: 'lg', label: 'Ganda' },
+      { code: 'li', label: 'Limburgish' },
+      { code: 'ln', label: 'Lingala' },
+      { code: 'lo', label: 'Lao' },
+      { code: 'lt', label: 'Lithuanian' },
+      { code: 'lu', label: 'Luba-Katanga' },
+      { code: 'lv', label: 'Latvian' },
+      { code: 'mg', label: 'Malagasy' },
+      { code: 'mh', label: 'Marshallese' },
+      { code: 'mi', label: 'Maori' },
+      { code: 'mk', label: 'Macedonian' },
+      { code: 'ml', label: 'Malayalam' },
+      { code: 'mn', label: 'Mongolian' },
+      { code: 'mr', label: 'Marathi' },
+      { code: 'ms', label: 'Malay' },
+      { code: 'mt', label: 'Maltese' },
+      { code: 'my', label: 'Burmese' },
+      { code: 'na', label: 'Nauru' },
+      { code: 'nb', label: 'Norwegian Bokmål' },
+      { code: 'nd', label: 'North Ndebele' },
+      { code: 'ne', label: 'Nepali' },
+      { code: 'ng', label: 'Ndonga' },
+      { code: 'nl', label: 'Dutch' },
+      { code: 'nn', label: 'Norwegian Nynorsk' },
+      { code: 'no', label: 'Norwegian' },
+      { code: 'nr', label: 'South Ndebele' },
+      { code: 'nv', label: 'Navajo' },
+      { code: 'ny', label: 'Chichewa' },
+      { code: 'oc', label: 'Occitan' },
+      { code: 'oj', label: 'Ojibwa' },
+      { code: 'om', label: 'Oromo' },
+      { code: 'or', label: 'Odia' },
+      { code: 'os', label: 'Ossetic' },
+      { code: 'pa', label: 'Punjabi' },
+      { code: 'pi', label: 'Pali' },
+      { code: 'pl', label: 'Polish' },
+      { code: 'ps', label: 'Pashto' },
+      { code: 'pt', label: 'Portuguese' },
+      { code: 'qu', label: 'Quechua' },
+      { code: 'rm', label: 'Romansh' },
+      { code: 'rn', label: 'Kirundi' },
+      { code: 'ro', label: 'Romanian' },
+      { code: 'ru', label: 'Russian' },
+      { code: 'rw', label: 'Kinyarwanda' },
+      { code: 'sa', label: 'Sanskrit' },
+      { code: 'sc', label: 'Sardinian' },
+      { code: 'sd', label: 'Sindhi' },
+      { code: 'se', label: 'Northern Sami' },
+      { code: 'sg', label: 'Sango' },
+      { code: 'si', label: 'Sinhala' },
+      { code: 'sk', label: 'Slovak' },
+      { code: 'sl', label: 'Slovenian' },
+      { code: 'sm', label: 'Samoan' },
+      { code: 'sn', label: 'Shona' },
+      { code: 'so', label: 'Somali' },
+      { code: 'sq', label: 'Albanian' },
+      { code: 'sr', label: 'Serbian' },
+      { code: 'ss', label: 'Swati' },
+      { code: 'st', label: 'Southern Sotho' },
+      { code: 'su', label: 'Sundanese' },
+      { code: 'sv', label: 'Swedish' },
+      { code: 'sw', label: 'Swahili' },
+      { code: 'ta', label: 'Tamil' },
+      { code: 'te', label: 'Telugu' },
+      { code: 'tg', label: 'Tajik' },
+      { code: 'th', label: 'Thai' },
+      { code: 'ti', label: 'Tigrinya' },
+      { code: 'tk', label: 'Turkmen' },
+      { code: 'tl', label: 'Tagalog / Filipino' },
+      { code: 'tn', label: 'Tswana' },
+      { code: 'to', label: 'Tonga' },
+      { code: 'tr', label: 'Turkish' },
+      { code: 'ts', label: 'Tsonga' },
+      { code: 'tt', label: 'Tatar' },
+      { code: 'tw', label: 'Twi' },
+      { code: 'ty', label: 'Tahitian' },
+      { code: 'ug', label: 'Uyghur' },
+      { code: 'uk', label: 'Ukrainian' },
+      { code: 'ur', label: 'Urdu' },
+      { code: 'uz', label: 'Uzbek' },
+      { code: 've', label: 'Venda' },
+      { code: 'vi', label: 'Vietnamese' },
+      { code: 'vo', label: 'Volapük' },
+      { code: 'wa', label: 'Walloon' },
+      { code: 'wo', label: 'Wolof' },
+      { code: 'xh', label: 'Xhosa' },
+      { code: 'yi', label: 'Yiddish' },
+      { code: 'yo', label: 'Yoruba' },
+      { code: 'za', label: 'Zhuang' },
+      { code: 'zh', label: 'Chinese' },
+      { code: 'zu', label: 'Zulu' },
+      // Common ISO 639-2/B codes used by subtitle addons
+      { code: 'vie', label: 'Vietnamese (vie)' },
+      { code: 'eng', label: 'English (eng)' },
+      { code: 'jpn', label: 'Japanese (jpn)' },
+      { code: 'kor', label: 'Korean (kor)' },
+      { code: 'zho', label: 'Chinese (zho)' },
+      { code: 'fra', label: 'French (fra)' },
+      { code: 'deu', label: 'German (deu)' },
+      { code: 'spa', label: 'Spanish (spa)' },
+      { code: 'por', label: 'Portuguese (por)' },
+      { code: 'ita', label: 'Italian (ita)' },
+      { code: 'rus', label: 'Russian (rus)' },
+      { code: 'ara', label: 'Arabic (ara)' },
+      { code: 'hin', label: 'Hindi (hin)' },
+      { code: 'tur', label: 'Turkish (tur)' },
+      { code: 'tha', label: 'Thai (tha)' },
+      { code: 'ind', label: 'Indonesian (ind)' },
+      { code: 'msa', label: 'Malay (msa)' },
+      { code: 'nld', label: 'Dutch (nld)' },
+      { code: 'pol', label: 'Polish (pol)' },
+      { code: 'swe', label: 'Swedish (swe)' },
+      { code: 'dan', label: 'Danish (dan)' },
+      { code: 'fin', label: 'Finnish (fin)' },
+      { code: 'nor', label: 'Norwegian (nor)' },
+      { code: 'ces', label: 'Czech (ces)' },
+      { code: 'ell', label: 'Greek (ell)' },
+      { code: 'heb', label: 'Hebrew (heb)' },
+      { code: 'ukr', label: 'Ukrainian (ukr)' },
+      { code: 'ron', label: 'Romanian (ron)' },
+      { code: 'hun', label: 'Hungarian (hun)' },
+    ].sort((a, b) => a.label.localeCompare(b.label));
 
     const selectedLangs = new Set();
+    let currentManifestUrl = '';
 
-    // ── Init language chips ────────────────────────────────────
-    function initLanguages() {
-      const grid = document.getElementById('langGrid');
-      LANGUAGES.forEach(lang => {
-        const chip = document.createElement('div');
-        chip.className = 'lang-chip';
-        chip.dataset.code = lang.code;
-        chip.textContent = lang.label;
-        chip.onclick = () => {
-          if (selectedLangs.has(lang.code)) {
-            selectedLangs.delete(lang.code);
-            chip.classList.remove('selected');
-          } else {
-            selectedLangs.add(lang.code);
-            chip.classList.add('selected');
-          }
-        };
-        grid.appendChild(chip);
+    // ── Language multi-select ──────────────────────────────────
+    function initLanguageOptions(filter = '') {
+      const box = document.getElementById('langOptions');
+      const q = filter.trim().toLowerCase();
+      box.innerHTML = '';
+      const list = q
+        ? LANGUAGES.filter(l =>
+            l.label.toLowerCase().includes(q) || l.code.toLowerCase() === q ||
+            l.code.toLowerCase().startsWith(q))
+        : LANGUAGES;
+      if (list.length === 0) {
+        box.innerHTML = '<div class="lang-opt" style="color:#666">No matches</div>';
+        return;
+      }
+      const frag = document.createDocumentFragment();
+      list.forEach(lang => {
+        const row = document.createElement('label');
+        row.className = 'lang-opt' + (selectedLangs.has(lang.code) ? ' selected' : '');
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = selectedLangs.has(lang.code);
+        cb.onchange = () => toggleLang(lang.code, cb.checked);
+        const name = document.createElement('span');
+        name.textContent = lang.label;
+        const code = document.createElement('span');
+        code.className = 'code';
+        code.textContent = lang.code;
+        row.append(cb, name, code);
+        frag.appendChild(row);
+      });
+      box.appendChild(frag);
+    }
+
+    function toggleLang(code, on) {
+      if (on) selectedLangs.add(code);
+      else selectedLangs.delete(code);
+      renderLangTags();
+      // keep checkbox state in current filter view
+      const opts = document.getElementById('langOptions');
+      opts.querySelectorAll('.lang-opt').forEach(row => {
+        const cb = row.querySelector('input[type=checkbox]');
+        const label = row.querySelector('span');
+        if (!cb || !label) return;
+        // match by code span
+        const codeEl = row.querySelector('.code');
+        if (codeEl && codeEl.textContent === code) {
+          cb.checked = on;
+          row.classList.toggle('selected', on);
+        }
       });
     }
+
+    function renderLangTags() {
+      const control = document.getElementById('langControl');
+      const placeholder = document.getElementById('langPlaceholder');
+      control.querySelectorAll('.lang-tag').forEach(el => el.remove());
+      if (selectedLangs.size === 0) {
+        placeholder.style.display = '';
+        return;
+      }
+      placeholder.style.display = 'none';
+      const byCode = Object.fromEntries(LANGUAGES.map(l => [l.code, l.label]));
+      // Cap visible tags to keep UI compact; count in a "+N" chip
+      const codes = Array.from(selectedLangs);
+      const maxShow = 12;
+      codes.slice(0, maxShow).forEach(code => {
+        const tag = document.createElement('span');
+        tag.className = 'lang-tag';
+        tag.innerHTML = `${byCode[code] || code}<button type="button" title="Remove" data-code="${code}">×</button>`;
+        tag.querySelector('button').onclick = (e) => {
+          e.stopPropagation();
+          selectedLangs.delete(code);
+          renderLangTags();
+          initLanguageOptions(document.getElementById('langSearch').value);
+        };
+        control.appendChild(tag);
+      });
+      if (codes.length > maxShow) {
+        const more = document.createElement('span');
+        more.className = 'lang-tag';
+        more.style.background = '#0f3460';
+        more.style.border = '1px solid #e94560';
+        more.textContent = `+${codes.length - maxShow} more`;
+        control.appendChild(more);
+      }
+    }
+
+    function toggleLangDropdown(e) {
+      if (e) e.stopPropagation();
+      const sel = document.getElementById('langSelect');
+      const open = !sel.classList.contains('open');
+      sel.classList.toggle('open', open);
+      if (open) {
+        const search = document.getElementById('langSearch');
+        search.value = '';
+        initLanguageOptions('');
+        setTimeout(() => search.focus(), 50);
+      }
+    }
+
+    function closeLangDropdown() {
+      document.getElementById('langSelect').classList.remove('open');
+    }
+
+    function clearLangs() {
+      selectedLangs.clear();
+      renderLangTags();
+      initLanguageOptions(document.getElementById('langSearch').value);
+    }
+
+    function filterLangs() {
+      initLanguageOptions(document.getElementById('langSearch').value);
+    }
+
+    function onLangSearchKey(e) {
+      if (e.key === 'Escape') closeLangDropdown();
+    }
+
+    // Close dropdown on outside click
+    document.addEventListener('click', (e) => {
+      const sel = document.getElementById('langSelect');
+      if (sel && !sel.contains(e.target)) closeLangDropdown();
+    });
 
     // ── Tab switching ──────────────────────────────────────────
     function switchTab(tab) {
@@ -216,17 +597,24 @@
       const list = document.getElementById(type === 'stream' ? 'streamList' : 'subList');
       const item = document.createElement('div');
       item.className = 'addon-item';
-      item.innerHTML = `
-        <input type="text" placeholder="https://example.com/manifest.json" value="${url || ''}">
-        <button class="btn-remove" onclick="removeAddon(this)" title="Remove">×</button>
-      `;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.placeholder = 'https://example.com/manifest.json';
+      input.value = url || '';
+      const btn = document.createElement('button');
+      btn.className = 'btn-remove';
+      btn.type = 'button';
+      btn.title = 'Remove';
+      btn.textContent = '×';
+      btn.onclick = () => removeAddon(btn);
+      item.append(input, btn);
       list.appendChild(item);
+      return input;
     }
 
     function removeAddon(btn) {
       const list = btn.closest('.addon-list');
       btn.closest('.addon-item').remove();
-      // Ensure at least one input remains
       if (list.children.length === 0) {
         addAddon(list.id === 'streamList' ? 'stream' : 'sub');
       }
@@ -239,6 +627,31 @@
         .filter(Boolean);
     }
 
+    function setAddonUrls(type, urls) {
+      const list = document.getElementById(type === 'stream' ? 'streamList' : 'subList');
+      list.innerHTML = '';
+      if (!urls || urls.length === 0) {
+        addAddon(type);
+        return;
+      }
+      urls.forEach(u => addAddon(type, u));
+    }
+
+    // ── Build config query string (same shape as server encodeConfig)
+    function buildConfigQuery() {
+      const params = new URLSearchParams();
+      getAddonUrls('stream').forEach(url => params.append('stream', url));
+      getAddonUrls('sub').forEach(url => params.append('sub', url));
+      if (selectedLangs.size > 0) {
+        params.set('lang', Array.from(selectedLangs).join(','));
+      }
+      return params.toString();
+    }
+
+    function buildManifestUrl() {
+      return window.location.origin + '/manifest.json?config=' + encodeURIComponent(buildConfigQuery());
+    }
+
     // ── Generate manifest URL ──────────────────────────────────
     function generate() {
       const streamUrls = getAddonUrls('stream');
@@ -248,22 +661,24 @@
         return;
       }
 
-      const params = new URLSearchParams();
-      streamUrls.forEach(url => params.append('stream', url));
-      subUrls.forEach(url => params.append('sub', url));
-      if (selectedLangs.size > 0) {
-        params.set('lang', Array.from(selectedLangs).join(','));
-      }
-
-      const manifestUrl = window.location.origin + '/manifest.json?config=' + encodeURIComponent(params.toString());
-      document.getElementById('manifestUrl').textContent = manifestUrl;
+      currentManifestUrl = buildManifestUrl();
+      document.getElementById('manifestUrl').textContent = currentManifestUrl;
       document.getElementById('result').classList.add('show');
+      document.getElementById('openRow').classList.add('show');
+      document.getElementById('btnStremio').classList.remove('disabled');
+      document.getElementById('btnStremioWeb').classList.remove('disabled');
+
+      // Keep browser URL in sync so refresh = reconfig
+      try {
+        const cfg = buildConfigQuery();
+        history.replaceState(null, '', `/configure?config=${encodeURIComponent(cfg)}`);
+        document.getElementById('reconfigBadge').classList.add('show');
+      } catch (_) {}
     }
 
     function copyUrl() {
       const url = document.getElementById('manifestUrl').textContent;
       const btn = document.querySelector('.btn-copy');
-      // Clipboard API requires HTTPS/localhost; fallback for HTTP
       if (navigator.clipboard && window.isSecureContext) {
         navigator.clipboard.writeText(url).then(() => {
           btn.textContent = 'Copied!';
@@ -283,10 +698,91 @@
       }
     }
 
+    // ── Open in Stremio / Stremio Web ──────────────────────────
+    function ensureManifestUrl() {
+      if (currentManifestUrl) return currentManifestUrl;
+      // Generate first if user only clicked the open buttons after edit
+      const streamUrls = getAddonUrls('stream');
+      const subUrls = getAddonUrls('sub');
+      if (streamUrls.length === 0 || subUrls.length === 0) return '';
+      generate();
+      return currentManifestUrl;
+    }
+
+    function openInStremio() {
+      const manifestUrl = ensureManifestUrl();
+      if (!manifestUrl) {
+        alert('Please generate a manifest URL first (need stream + subtitle addons).');
+        return;
+      }
+      // Desktop Stremio registers stremio:// for addon install links
+      const stremioUrl = manifestUrl.replace(/^https?:\/\//, 'stremio://');
+      window.location.href = stremioUrl;
+    }
+
+    function openInStremioWeb() {
+      const manifestUrl = ensureManifestUrl();
+      if (!manifestUrl) {
+        alert('Please generate a manifest URL first (need stream + subtitle addons).');
+        return;
+      }
+      // Stremio Web deep-link into Addons with install URL
+      const webUrl = 'https://web.stremio.com/#/addons?addon=' + encodeURIComponent(manifestUrl);
+      window.open(webUrl, '_blank', 'noopener');
+    }
+
+    // ── Reconfig: parse ?config=… (or stream/sub/lang params) ──
+    function loadConfigFromUrl() {
+      const search = new URLSearchParams(window.location.search);
+      let cfg = search.get('config');
+
+      // Also accept flat params: /configure?stream=…&stream=…&sub=…&lang=…
+      if (!cfg) {
+        const flat = new URLSearchParams();
+        let any = false;
+        search.getAll('stream').forEach(v => { flat.append('stream', v); any = true; });
+        search.getAll('sub').forEach(v => { flat.append('sub', v); any = true; });
+        const lang = search.get('lang');
+        if (lang) { flat.set('lang', lang); any = true; }
+        if (any) cfg = flat.toString();
+      }
+
+      if (!cfg) return false;
+
+      const p = new URLSearchParams(cfg);
+      const streams = p.getAll('stream').filter(Boolean);
+      const subs = p.getAll('sub').filter(Boolean);
+      const langs = (p.get('lang') || '').split(',').map(s => s.trim()).filter(Boolean);
+
+      if (streams.length) setAddonUrls('stream', streams);
+      if (subs.length) setAddonUrls('sub', subs);
+
+      langs.forEach(code => selectedLangs.add(code));
+      renderLangTags();
+      initLanguageOptions('');
+
+      document.getElementById('reconfigBadge').classList.add('show');
+
+      // Prefill result if config is complete
+      if (streams.length && subs.length) {
+        currentManifestUrl = buildManifestUrl();
+        document.getElementById('manifestUrl').textContent = currentManifestUrl;
+        document.getElementById('result').classList.add('show');
+        document.getElementById('openRow').classList.add('show');
+        document.getElementById('btnStremio').classList.remove('disabled');
+        document.getElementById('btnStremioWeb').classList.remove('disabled');
+      }
+
+      // Highlight stream tab if it has content (default)
+      if (subs.length && !streams.length) switchTab('sub');
+      return true;
+    }
+
     // ── Init ───────────────────────────────────────────────────
-    initLanguages();
+    initLanguageOptions('');
     addAddon('stream');
     addAddon('sub');
+    loadConfigFromUrl();
   </script>
 </body>
 </html>
