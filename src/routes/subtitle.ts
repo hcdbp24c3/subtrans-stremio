@@ -18,6 +18,9 @@ const MAX_SUBS_PER_LANG = 5;
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const SUB_DOWNLOAD_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const subDownloadCache = createTtlStore<{ body: Buffer; contentType: string }>(100);
+// Aligned (offset-applied) subtitle bodies keyed by token — Nuvio needs http(s) URLs, not data:
+const alignedSubCache = createTtlStore<{ body: Buffer; contentType: string }>(100);
+const ALIGNED_SUB_TTL_MS = 30 * 60 * 1000; // ≥ subtitle list cache TTL
 
 interface Subtitle {
   id: string;
@@ -25,7 +28,8 @@ interface Subtitle {
   lang?: string;
   _format?: SubtitleFormat;
   _source?: number; // index of the sub addon that provided this subtitle
-  _releaseName?: string; // release name from the sub addon (for matching with video)
+  _releaseName?: string; // release name of the sub (for matching with video)
+  _aligned?: boolean; // internal: body cached under aligned:<token> → /alignedsub/
 }
 
 interface StreamResponse {
@@ -320,7 +324,8 @@ router.get('/subtitles/:type/*', async (req, res) => {
   }
 
   // 7. If offset detected, re-download all subs and re-serialize with offset applied
-  //    (using resolved upstream URLs for download)
+  //    (using resolved upstream URLs for download).
+  //    Aligned bodies are served from an HTTP endpoint (Nuvio rejects data: URLs).
   const alignedSubtitles: Subtitle[] = [];
   for (const sub of allSubs) {
     if (offset !== 0) {
@@ -333,7 +338,7 @@ router.get('/subtitles/:type/*', async (req, res) => {
 
           if (format === 'ass') {
             // Nuvio Android cannot parse ASS (ICU regex crash on unescaped }).
-            // Convert to SRT after offsetting so the data URL is always SRT.
+            // Convert to SRT after offsetting.
             const entries = parseSubtitle(subContent, 'ass');
             if (entries.length > 0) {
               adjustedContent = reSerialize(adjustEntries(entries, offset), 'srt');
@@ -348,8 +353,20 @@ router.get('/subtitles/:type/*', async (req, res) => {
           }
 
           if (adjustedContent) {
-            const dataUrl = `data:text/plain;base64,${Buffer.from(adjustedContent).toString('base64')}`;
-            alignedSubtitles.push({ ...sub, url: dataUrl });
+            const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+            alignedSubCache.set(
+              token,
+              {
+                body: Buffer.from(adjustedContent, 'utf-8'),
+                contentType: 'text/plain; charset=utf-8',
+              },
+              ALIGNED_SUB_TTL_MS,
+            );
+            alignedSubtitles.push({
+              ...sub,
+              url: `aligned:${token}`,
+              _aligned: true,
+            });
             continue;
           }
         }
@@ -362,22 +379,47 @@ router.get('/subtitles/:type/*', async (req, res) => {
   const base = `${req.protocol}://${req.headers.host || 'localhost'}`;
   const configParam = encodeURIComponent(encodeConfig(config));
   const finalSubtitles = alignedSubtitles.map((sub) => {
-    // Skip data URLs (already encoded) or proxy URLs (already rewritten)
-    if (sub.url.startsWith('data:') || sub.url.startsWith(base)) {
-      return { ...sub } as Subtitle;
+    // Aligned content: serve via HTTP endpoint (Nuvio cannot read data: URLs)
+    if (sub._aligned && sub.url.startsWith('aligned:')) {
+      const token = sub.url.slice('aligned:'.length);
+      return {
+        ...sub,
+        url: `${base}/alignedsub/${token}.srt`,
+      };
+    }
+    // Skip proxy URLs (already rewritten)
+    if (sub.url.startsWith(base)) {
+      return { ...sub };
     }
     const ext = detectFileExt(sub.url);
     return {
       ...sub,
       url: `${base}/subdownload${ext}?url=${encodeURIComponent(sub.url)}&config=${configParam}`,
-    } as Subtitle;
+    };
   });
   const result = {
-    subtitles: finalSubtitles.map(({ _format, ...rest }) => rest),
+    subtitles: finalSubtitles.map(({ _format, _aligned, ...rest }) => rest),
   };
   setCache(key, result);
 
   res.json(result);
+});
+
+// ── Aligned subtitle content endpoint ──────────────────────────────
+// Serves offset-applied SRT bodies stored during the /subtitles response.
+// Nuvio/Stremio clients only fetch http(s) URLs — no data: support.
+router.get('/alignedsub/:token.:ext', (req, res) => {
+  const token = req.params.token;
+  const ext = (req.params.ext || 'srt').toLowerCase();
+  const hit = alignedSubCache.get(token);
+  if (!hit) {
+    res.status(404).json({ error: 'Aligned subtitle not found or expired' });
+    return;
+  }
+  res.setHeader('Content-Type', ext === 'vtt' ? 'text/vtt; charset=utf-8' : 'text/plain; charset=utf-8');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'public, max-age=1800');
+  res.send(hit.body);
 });
 
 // ── Subtitle download proxy ───────────────────────────────────────
