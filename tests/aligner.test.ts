@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   calculateOffsetFromReference, adjustEntries, parseFfsubsyncOutput,
-  countSrtEntries, parseDurationFromProbeLine, SubtitleEntry,
+  parseFfsubsyncBridgeJson, countSrtEntries, parseDurationFromProbeLine, SubtitleEntry,
 } from '../src/lib/aligner.js';
 
 describe('parseFfsubsyncOutput', () => {
@@ -16,6 +16,25 @@ describe('parseFfsubsyncOutput', () => {
 
   it('returns null when no offset line', () => {
     expect(parseFfsubsyncOutput('nothing here')).toBeNull();
+  });
+});
+
+describe('parseFfsubsyncBridgeJson', () => {
+  it('parses last-line JSON with ok=true', () => {
+    const out = 'noise\n{"offset": 28.8, "score": 19976, "ok": true, "retval": 0}\n';
+    expect(parseFfsubsyncBridgeJson(out)).toEqual({ offset: 28.8, score: 19976 });
+  });
+
+  it('returns null when ok=false', () => {
+    expect(parseFfsubsyncBridgeJson('{"offset": 0, "score": 0, "ok": false}')).toBeNull();
+  });
+
+  it('returns null when offset is 0', () => {
+    expect(parseFfsubsyncBridgeJson('{"offset": 0, "score": 100, "ok": true}')).toBeNull();
+  });
+
+  it('returns null when no JSON line', () => {
+    expect(parseFfsubsyncBridgeJson('no json here')).toBeNull();
   });
 });
 

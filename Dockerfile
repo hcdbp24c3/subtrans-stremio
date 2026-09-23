@@ -33,6 +33,8 @@ RUN npm install -g bun && bun install --frozen-lockfile --production
 
 COPY --from=builder /app/dist ./dist
 COPY src/views/ ./dist/views/
+# Python bridge for ffsubsync library (not emitted by tsc)
+COPY src/lib/ffsubsync_run.py ./dist/lib/ffsubsync_run.py
 
 EXPOSE 5100
 
