@@ -16,5 +16,8 @@ export function generateManifest(
     behavior: {
       bingeOnly: false,
     },
+    behaviorHints: {
+      configurable: true,
+    },
   };
 }
