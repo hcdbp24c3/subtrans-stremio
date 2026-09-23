@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { detectFormat, sniffFormat, parseSubtitle } from '../src/lib/subtitle-parser.js';
+import { sniffFormat, parseSubtitle } from '../src/lib/subtitle-parser.js';
 import { detectFileExt } from '../src/routes/subtitle-ext.js';
 
 describe('Nuvio format safety (Android ICU regex)', () => {
