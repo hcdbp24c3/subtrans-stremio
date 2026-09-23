@@ -236,9 +236,58 @@ export function isFfsubsyncAvailable(): boolean {
   } catch { return false; }
 }
 
+/** Parse ffsubsync CLI stdout for offset + score. Returns null if no offset line. */
+export function parseFfsubsyncOutput(output: string): { offset: number; score: number } | null {
+  const offsetMatch = output.match(/offset seconds:\s*([-\d.]+)/);
+  if (!offsetMatch) return null;
+  const scoreMatch = output.match(/score:\s*([\d.]+)/);
+  return {
+    offset: parseFloat(offsetMatch[1]),
+    score: scoreMatch ? parseFloat(scoreMatch[1]) : 0,
+  };
+}
+
 /**
- * Calculate subtitle sync offset using ffsubsync CLI.
- * Subtitle-to-subtitle alignment (no video/audio needed).
+ * Sync a subtitle against the VIDEO (audio/VAD reference) via ffsubsync.
+ * Works when the video has no text builtin subs (PGS-only remuxes).
+ */
+export function calculateOffsetWithFfsubsyncVideo(videoUrl: string, targetSubContent: string): number {
+  const targetFile = join(tmpdir(), `ffs_target_${Date.now()}.srt`);
+  const outputFile = join(tmpdir(), `ffs_out_${Date.now()}.srt`);
+
+  try {
+    writeFileSync(targetFile, targetSubContent, 'utf-8');
+    const refUrl = resolveRedirect(videoUrl);
+
+    // Video reference can take longer (remote stream + audio extract)
+    const result = execSync(
+      `ffsubsync "${refUrl}" -i "${targetFile}" -o "${outputFile}" --no-fix-framerate 2>&1`,
+      { encoding: 'utf-8', timeout: 120000, maxBuffer: 10 * 1024 * 1024 },
+    );
+
+    const parsed = parseFfsubsyncOutput(result);
+    if (!parsed) {
+      console.log(`[aligner] ffsubsync(video): no offset found in output`);
+      return 0;
+    }
+    console.log(`[aligner] ffsubsync(video): offset=${parsed.offset.toFixed(3)}s, score=${parsed.score}`);
+    if (parsed.score <= 0) {
+      console.log(`[aligner] ffsubsync(video): low confidence (score<=0), ignoring offset`);
+      return 0;
+    }
+    return parsed.offset;
+  } catch (e: any) {
+    console.log(`[aligner] ffsubsync(video) failed: ${e.message?.substring(0, 200)}`);
+    return 0;
+  } finally {
+    try { unlinkSync(targetFile); } catch {}
+    try { unlinkSync(outputFile); } catch {}
+  }
+}
+
+/**
+ * Calculate subtitle sync offset using ffsubsync CLI (sub-to-sub reference).
+ * Prefer calculateOffsetWithFfsubsyncVideo when a video URL is available.
  */
 export function calculateOffsetWithFfsubsync(referenceSrtContent: string, targetSrtContent: string): number {
   const refFile = join(tmpdir(), `ffs_ref_${Date.now()}.srt`);
@@ -254,21 +303,17 @@ export function calculateOffsetWithFfsubsync(referenceSrtContent: string, target
       { encoding: 'utf-8', timeout: 30000 },
     );
 
-    const offsetMatch = result.match(/offset seconds:\s*([-\d.]+)/);
-    const scoreMatch = result.match(/score:\s*([\d.]+)/);
-
-    if (offsetMatch) {
-      const offset = parseFloat(offsetMatch[1]);
-      const score = scoreMatch ? parseFloat(scoreMatch[1]) : 0;
-      console.log(`[aligner] ffsubsync: offset=${offset.toFixed(3)}s, score=${score}`);
-      if (score <= 0) {
-        console.log(`[aligner] ffsubsync: low confidence (score<=0), ignoring offset`);
-        return 0;
-      }
-      return offset;
+    const parsed = parseFfsubsyncOutput(result);
+    if (!parsed) {
+      console.log(`[aligner] ffsubsync: no offset found in output`);
+      return 0;
     }
-    console.log(`[aligner] ffsubsync: no offset found in output`);
-    return 0;
+    console.log(`[aligner] ffsubsync: offset=${parsed.offset.toFixed(3)}s, score=${parsed.score}`);
+    if (parsed.score <= 0) {
+      console.log(`[aligner] ffsubsync: low confidence (score<=0), ignoring offset`);
+      return 0;
+    }
+    return parsed.offset;
   } catch (e: any) {
     console.log(`[aligner] ffsubsync failed: ${e.message?.substring(0, 200)}`);
     return 0;

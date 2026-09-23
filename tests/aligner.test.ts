@@ -1,5 +1,20 @@
 import { describe, it, expect } from 'vitest';
-import { calculateOffsetFromReference, adjustEntries, SubtitleEntry } from '../src/lib/aligner.js';
+import { calculateOffsetFromReference, adjustEntries, parseFfsubsyncOutput, SubtitleEntry } from '../src/lib/aligner.js';
+
+describe('parseFfsubsyncOutput', () => {
+  it('parses offset and score', () => {
+    const out = 'ffsubsync: offset seconds: 2.5\nscore: 0.87';
+    expect(parseFfsubsyncOutput(out)).toEqual({ offset: 2.5, score: 0.87 });
+  });
+
+  it('parses negative offset, default score 0 when missing', () => {
+    expect(parseFfsubsyncOutput('offset seconds: -1.25')).toEqual({ offset: -1.25, score: 0 });
+  });
+
+  it('returns null when no offset line', () => {
+    expect(parseFfsubsyncOutput('nothing here')).toBeNull();
+  });
+});
 
 describe('aligner', () => {
   // ── calculateOffsetFromReference ──────────────────────────────────

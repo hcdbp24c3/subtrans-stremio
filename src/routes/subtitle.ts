@@ -3,17 +3,10 @@ import { decodeConfig, encodeConfig, AddonConfig } from '../config.js';
 import { fetchJson, fetchText } from '../lib/proxy.js';
 import { detectFormat, parseSubtitle, SubtitleFormat } from '../lib/subtitle-parser.js';
 import {
-  calculateOffsetFromReference, getVideoDuration, adjustEntries,
-  extractBuiltinSubtitle,
-  calculateOffsetWithFfsubsync, isFfsubsyncAvailable,
+  calculateOffsetWithFfsubsyncVideo, adjustEntries,
+  isFfsubsyncAvailable,
   probeVideoInfo, VideoProbeResult,
 } from '../lib/aligner.js';
-import {
-  extractEncodeKeywords,
-  encodeCompatible,
-  releaseNameMatchScore,
-  sortByReleaseMatch,
-} from '../lib/release-match.js';
 import { createTtlStore } from '../lib/ttl-store.js';
 
 const router = Router();
@@ -166,23 +159,6 @@ function limitPerLanguage(subs: Subtitle[], limit: number): Subtitle[] {
   });
 }
 
-/**
- * Strategy D helper: if the best subtitle's last cue ends well past the
- * video duration, the sub is from a longer cut — shift it back.
- * Returns a negative offset (seconds) or 0 when no confident overrun.
- */
-export function durationOverrunOffset(
-  videoDuration: number | null,
-  lastCueEnd: number,
-  slackSec = 3,
-): number {
-  if (videoDuration === null || !Number.isFinite(videoDuration) || !Number.isFinite(lastCueEnd)) return 0;
-  const overrun = lastCueEnd - videoDuration;
-  if (overrun <= slackSec) return 0;
-  const offset = videoDuration - lastCueEnd; // negative
-  return Math.max(offset, -600);
-}
-
 /** Drop duplicate subtitle entries by exact URL, keeping first occurrence. */
 export function dedupeSubtitles(subs: Subtitle[]): Subtitle[] {
   const seen = new Set<string>();
@@ -304,188 +280,47 @@ router.get('/subtitles/:type/*', async (req, res) => {
     _format: detectFormat(sub.url) || undefined,
   })) as Subtitle[];
 
-  // 6. Align subtitles with the video using multiple strategies:
-  //    Priority: match subtitle release → cross-correlation → audio detection
+  // 6. Align: single path — ffsubsync against the VIDEO (audio/VAD).
+  //    No encode ranking, no cross-addon, no duration heuristic.
   let offset = 0;
-
-  // ── Strategy A: Match subtitle release name to video filename ──────
-  // Subtitles are release-specific — a sub synced for "AMZN.WEB-DL" won't
-  // match a "BluRay" encode if they have different intros. By matching the
-  // release name, we pick the right sub and avoid offset entirely.
-  if (videoFilename) {
-    allSubs = sortByReleaseMatch(allSubs, videoFilename);
-    const bestMatch = allSubs[0];
-    const bestScore = releaseNameMatchScore(videoFilename, bestMatch?._releaseName || '');
-    const videoEncode = extractEncodeKeywords(videoFilename);
-    let encodeMatch = 0, encodeMismatch = 0;
-    let firstMismatchName = '';
-    for (const s of allSubs) {
-      const subEnc = extractEncodeKeywords(s._releaseName || '');
-      if (encodeCompatible(videoEncode, subEnc)) encodeMatch++;
-      else {
-        encodeMismatch++;
-        if (!firstMismatchName) firstMismatchName = s._releaseName || '';
-      }
-    }
-    console.log(`[subtitle] Strategy A (release match): best=${bestScore.toFixed(2)} (${encodeMatch} matched, ${encodeMismatch} mismatched encode)`);
-    if (encodeMismatch > 0) {
-      console.log(`[subtitle] Encode mismatch example: video=[${[...videoEncode]}] sub=[${[...extractEncodeKeywords(firstMismatchName)]}] "${firstMismatchName}"`);
-    }
-    if (encodeMatch === 0 && videoEncode.size > 0 && allSubs.length > 0) {
-      console.log(`[subtitle] ⚠ NO SUBS FOR THIS ENCODE: video needs [${[...videoEncode].join(',')}], ${encodeMismatch} subs all from different encodes`);
-      console.log(`[subtitle] Serving best available sub but timing may differ. Use Stremio offset to adjust.`);
-    }
-  } else {
-    console.log(`[subtitle] Strategy A (release match): skipped (no video filename)`);
-  }
-
-  // ── Strategy B: Cross-correlation between DIFFERENT sub addons ──────
-  // If subs from different addons disagree on timing, detect the offset.
-  // (In practice, most sources sync to the same encode — this rarely fires.)
-  if (offset === 0) {
-    const sourceGroups = new Map<number, Subtitle[]>();
-    for (const s of allSubs) {
-      const src = s._source ?? -1;
-      if (!sourceGroups.has(src)) sourceGroups.set(src, []);
-      sourceGroups.get(src)!.push(s);
-    }
-    const sourceIndices = [...sourceGroups.keys()].filter((k) => k >= 0);
-
-    if (sourceIndices.length >= 2) {
-      console.log(`[subtitle] Strategy B (cross-addon): comparing ${sourceIndices.length} addon sources...`);
-      const crossOffsets: number[] = [];
-
-      for (let i = 0; i < sourceIndices.length; i++) {
-        for (let j = i + 1; j < sourceIndices.length; j++) {
-          const subsA = sourceGroups.get(sourceIndices[i])!;
-          const subsB = sourceGroups.get(sourceIndices[j])!;
-
-          const byLangA = new Map<string, Subtitle[]>();
-          for (const s of subsA) {
-            const lang = normalizeLang(s.lang || '');
-            if (!byLangA.has(lang)) byLangA.set(lang, []);
-            byLangA.get(lang)!.push(s);
-          }
-          const byLangB = new Map<string, Subtitle[]>();
-          for (const s of subsB) {
-            const lang = normalizeLang(s.lang || '');
-            if (!byLangB.has(lang)) byLangB.set(lang, []);
-            byLangB.get(lang)!.push(s);
-          }
-
-          for (const [lang, langSubsA] of byLangA) {
-            const langSubsB = byLangB.get(lang);
-            if (!langSubsB || langSubsB.length === 0) continue;
-
-            const fmtA = langSubsA[0]._format || 'srt' as SubtitleFormat;
-            const fmtB = langSubsB[0]._format || 'srt' as SubtitleFormat;
-            const realUrlA = resolveRealUrl(langSubsA[0].url);
-            const realUrlB = resolveRealUrl(langSubsB[0].url);
-
-            const [contentA, contentB] = await Promise.all([fetchText(realUrlA), fetchText(realUrlB)]);
-            if (!contentA || !contentB) continue;
-
-            const entriesA = parseSubtitle(contentA, fmtA);
-            const entriesB = parseSubtitle(contentB, fmtB);
-            if (entriesA.length === 0 || entriesB.length === 0) continue;
-
-            const pairOffset = calculateOffsetFromReference(entriesA, entriesB);
-            if (pairOffset !== 0) {
-              crossOffsets.push(pairOffset);
-              console.log(`[subtitle]   Addon ${sourceIndices[i]} vs ${sourceIndices[j]} [${lang}]: ${pairOffset.toFixed(1)}s`);
-            }
-          }
-        }
-      }
-
-      if (crossOffsets.length > 0) {
-        crossOffsets.sort((a, b) => a - b);
-        offset = crossOffsets[Math.floor(crossOffsets.length / 2)];
-        console.log(`[subtitle] Strategy B (cross-addon): offset=${offset.toFixed(1)}s from ${crossOffsets.length} pairs`);
-      } else {
-        console.log(`[subtitle] Strategy B (cross-addon): addons agree (no offset detected)`);
-      }
-    }
-  }
-
-  // ── Strategy C: Subtitle-to-subtitle sync via ffsubsync ──────────
-  // Extract built-in English subtitle from the video, then use ffsubsync
-  // to find the sync offset between it and the external subtitle.
-  // This is the most reliable method — works even when no cross-addon
-  // subs are available, and handles translation timing differences.
-  // Uses offset cache to avoid re-extraction for the same video.
-  if (offset === 0 && videoUrl && isFfsubsyncAvailable()) {
-    // Check offset cache first (avoids re-extraction)
+  if (videoUrl && isFfsubsyncAvailable()) {
     const cachedOffset = getOffsetFromCache(videoUrl);
     if (cachedOffset !== null) {
       offset = cachedOffset;
     } else {
-      console.log(`[subtitle] Strategy C (ffsubsync): checking for builtin subs...`);
-      try {
-        // Use pre-probed subtitle streams (from combined ffprobe)
-        const streams = videoProbe?.subtitleStreams || [];
-        if (streams.length === 0) {
-          console.log(`[subtitle] Strategy C: no text subtitle streams found in video`);
-        } else {
-          // Find best English stream from pre-probed list
-          const engStream = streams.find((s: { lang: string }) => s.lang.startsWith('eng') || s.lang === 'en') || streams[0];
-          console.log(`[subtitle] Strategy C: extracting builtin sub stream ${engStream.index} (${engStream.lang})...`);
-          const builtinSrt = extractBuiltinSubtitle(videoUrl, engStream.index, 30);
-          if (builtinSrt) {
-            const bestSub = allSubs[0];
-            if (bestSub) {
-              const realUrl = resolveRealUrl(bestSub.url);
-              console.log(`[subtitle] Strategy C: running ffsubsync against best sub...`);
-              const subContent = await fetchText(realUrl);
-              if (subContent) {
-                const ffsubsyncOffset = calculateOffsetWithFfsubsync(builtinSrt, subContent);
-                if (ffsubsyncOffset !== 0) {
-                  offset = ffsubsyncOffset;
-                  setOffsetCache(videoUrl, offset);
-                  console.log(`[subtitle] Strategy C (ffsubsync): offset=${offset.toFixed(3)}s`);
-                } else {
-                  console.log(`[subtitle] Strategy C (ffsubsync): no offset detected (subs already synced)`);
-                }
+      const bestSub = allSubs[0];
+      if (bestSub) {
+        try {
+          const realUrl = resolveRealUrl(bestSub.url);
+          console.log(`[subtitle] ffsubsync: syncing best sub against video audio...`);
+          const subContent = await fetchText(realUrl);
+          if (subContent) {
+            // ffsubsync wants SRT-shaped text; convert ASS/VTT for analysis only
+            const fmt = (bestSub._format || 'srt') as SubtitleFormat;
+            let analysisSrt = subContent;
+            if (fmt !== 'srt') {
+              const entries = parseSubtitle(subContent, fmt);
+              if (entries.length > 0) {
+                analysisSrt = reSerialize(entries, 'srt') || subContent;
               }
             }
-          } else {
-            console.log(`[subtitle] Strategy C: failed to extract builtin sub (timeout or no text subs)`);
+            offset = calculateOffsetWithFfsubsyncVideo(videoUrl, analysisSrt);
+            if (offset !== 0) {
+              setOffsetCache(videoUrl, offset);
+              console.log(`[subtitle] ffsubsync: offset=${offset.toFixed(3)}s (cached for this video)`);
+            } else {
+              console.log(`[subtitle] ffsubsync: no offset (already synced or low confidence)`);
+            }
           }
-        }
-      } catch (e: any) {
-        console.log(`[subtitle] Strategy C: error: ${e.message?.substring(0, 200)}`);
-      }
-    }
-  } else if (offset === 0 && videoUrl && !isFfsubsyncAvailable()) {
-    console.log(`[subtitle] Strategy C: ffsubsync not available, skipping`);
-  }
-
-  // ── Strategy D: duration overrun (last resort) ─────────────────────
-  // Strategies A–C can all no-op when every sub is the wrong encode and
-  // the video has no text builtin subs. If the best sub's last cue runs
-  // well past the probed video duration, shift it back.
-  if (offset === 0 && videoDuration && allSubs.length > 0) {
-    const bestSub = allSubs[0];
-    const fmt = (bestSub._format || 'srt') as SubtitleFormat;
-    try {
-      const realUrl = resolveRealUrl(bestSub.url);
-      const subContent = await fetchText(realUrl);
-      if (subContent) {
-        const entries = parseSubtitle(subContent, fmt);
-        if (entries.length > 0) {
-          const lastCueEnd = entries[entries.length - 1].end;
-          const dOffset = durationOverrunOffset(videoDuration, lastCueEnd);
-          if (dOffset !== 0) {
-            offset = dOffset;
-            console.log(`[subtitle] Strategy D (duration overrun): sub ends ${lastCueEnd.toFixed(1)}s > video ${videoDuration.toFixed(1)}s → offset=${offset.toFixed(1)}s`);
-          } else {
-            console.log(`[subtitle] Strategy D (duration overrun): no overrun (sub end=${lastCueEnd.toFixed(1)}s, video=${videoDuration.toFixed(1)}s)`);
-          }
+        } catch (e: any) {
+          console.log(`[subtitle] ffsubsync: error: ${e.message?.substring(0, 200)}`);
         }
       }
-    } catch (e: any) {
-      console.log(`[subtitle] Strategy D: error: ${e.message?.substring(0, 200)}`);
     }
+  } else if (videoUrl && !isFfsubsyncAvailable()) {
+    console.log(`[subtitle] ffsubsync not available, serving subs without alignment`);
+  } else {
+    console.log(`[subtitle] no video URL, serving subs without alignment`);
   }
 
   // 7. If offset detected, re-download all subs and re-serialize with offset applied
