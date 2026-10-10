@@ -252,15 +252,21 @@ export function findBestRefSubtitleStream(videoUrl: string): SubtitleStreamInfo 
 export async function extractBuiltinSubtitle(
   videoUrl: string,
   streamIndex: number,
-  timeoutSec = 60,
+  timeoutSec = 30,
 ): Promise<string | null> {
   const tmpFile = join(tmpdir(), `builtin_sub_${streamIndex}_${Date.now()}.srt`);
+  // -sn: only scan subtitle streams (skip video/audio analysis = much faster
+  //       for large files where ffprobe would otherwise scan GBs of packets)
+  // -probesize 64M: analyze up to 64MB instead of 32 — needed for some
+  //                  MKV files with header-stored sub timing that won't
+  //                  show up in 32M
+  // -analyzeduration 0: don't waste time on A/V analysis
+  // -c:s srt: re-mux to plain SRT
+  const cmd = `timeout ${timeoutSec} ffmpeg -y -probesize 64M -analyzeduration 0 -sn -i "${videoUrl}" ` +
+    `-map 0:${streamIndex} -c:s srt -f srt "${tmpFile}" 2>/dev/null`;
   try {
     console.log(`[aligner] Extracting builtin sub stream ${streamIndex} (timeout ${timeoutSec}s)...`);
-    await execAsync(
-      `timeout ${timeoutSec} ffmpeg -y -probesize 32 -analyzeduration 0 -i "${videoUrl}" -map 0:${streamIndex} -c:s srt -f srt "${tmpFile}" 2>/dev/null`,
-      (timeoutSec + 10) * 1000,
-    );
+    await execAsync(cmd, (timeoutSec + 10) * 1000);
     if (existsSync(tmpFile)) {
       const content = readFileSync(tmpFile, 'utf-8');
       try { unlinkSync(tmpFile); } catch {}
