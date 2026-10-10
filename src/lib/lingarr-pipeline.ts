@@ -108,9 +108,11 @@ export async function runLingarrPipeline(
   const log: LingarrLogEntry[] = [];
   const baseUrl = resolveLingarrUrl(input.config);
   if (!baseUrl) {
+    console.log('[lingarr] pipeline skip: no Lingarr URL configured');
     return { subs: input.subs, translated: false, log };
   }
   if (input.budgetMs < MIN_BUDGET_MS) {
+    console.log(`[lingarr] pipeline skip: budget low (${input.budgetMs}ms < ${MIN_BUDGET_MS}ms)`);
     return { subs: input.subs, translated: false, log };
   }
   const targets = (input.config.translateTargets ?? [])
@@ -118,6 +120,7 @@ export async function runLingarrPipeline(
     .filter(Boolean)
     .slice(0, MAX_LANGS_PER_REQUEST);
   if (targets.length === 0) {
+    console.log('[lingarr] pipeline skip: no targets after normalization');
     return { subs: input.subs, translated: false, log };
   }
 
@@ -131,7 +134,10 @@ export async function runLingarrPipeline(
     probed = true;
     available = await pingLingarr(baseUrl, resolveLingarrApiKey(input.config));
     if (!available) {
+      console.log(`[lingarr] ping failed: ${baseUrl} unreachable or wrong api key`);
       for (const t of targets) log.push({ target: t, source: '', status: 'unavailable' });
+    } else {
+      console.log(`[lingarr] ping OK: ${baseUrl}`);
     }
     return available;
   };

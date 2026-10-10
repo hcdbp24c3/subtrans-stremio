@@ -380,7 +380,11 @@ router.get('/subtitles/:type/*', async (req, res) => {
   //      rewrite step below serves them via the existing /alignedsub endpoint.
   //      Built-in source (from background-extracted cache) takes priority over
   //      upstream subs when both are available.
-  if (config.translateTargets.length > 0 && budgetLeftMs() >= 4_000) {
+  if (config.translateTargets.length === 0) {
+    console.log(`[lingarr] skip: no translateTargets configured`);
+  } else if (budgetLeftMs() < 4_000) {
+    console.log(`[lingarr] skip: budget low (${budgetLeftMs()}ms < 4000ms)`);
+  } else {
     const lingarrInput: LingarrSourceSub[] = allSubs.map((s) => ({
       id: s.id,
       url: s.url,
@@ -388,6 +392,7 @@ router.get('/subtitles/:type/*', async (req, res) => {
       format: s._format,
       normLang: s.lang ? normalizeLang(s.lang) : '',
     }));
+    console.log(`[lingarr] running: targets=[${config.translateTargets.join(',')}] builtinSource=${builtinSource ? 'yes' : 'no'} budgetMs=${budgetLeftMs()}`);
     const lingarrOut = await runLingarrPipeline({
       subs: lingarrInput,
       config,
@@ -414,6 +419,14 @@ router.get('/subtitles/:type/*', async (req, res) => {
       for (const entry of lingarrOut.log) {
         console.log(`[lingarr] ${entry.target} ← ${entry.source || '?'} ${entry.status}${entry.detail ? ` (${entry.detail})` : ''}`);
       }
+    } else if (lingarrOut.log.length > 0) {
+      // Pipeline ran but produced nothing — surface why
+      console.log(`[lingarr] no translation: ${lingarrOut.log.length} log entries`);
+      for (const entry of lingarrOut.log) {
+        console.log(`[lingarr] ${entry.target} ← ${entry.source || '?'} ${entry.status}${entry.detail ? ` (${entry.detail})` : ''}`);
+      }
+    } else {
+      console.log(`[lingarr] no translation (pipeline returned empty log)`);
     }
   }
 
