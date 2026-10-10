@@ -44,12 +44,12 @@ Open http://localhost:5100/configure
 Self-host a [Lingarr](https://github.com/lingarr-translate/lingarr) instance and point the configure page at it. The addon will then:
 
 - Detect which target languages (e.g. `vi`, `ja`) are missing from the upstream sub addons
-- Pick the best available source sub (English preferred, then first available)
+- Pick the best available source — either an upstream sub or, when no upstream subs are available, a **text track extracted from the video itself** via ffmpeg (background, non-blocking — first request returns 0 subs while the track is being extracted; subsequent requests serve the cached translation)
 - Translate it via Lingarr's `/api/translate/content` endpoint
 - Stitch the translated lines back onto the source sub's timestamps
-- Cache the result (7 days) and serve it as if it were a regular sub
+- Cache the result (7 days for translations, 24h for extracted built-in tracks) and serve it as if it were a regular sub
 
-Lingarr is **optional**. Without it, the addon behaves exactly as before. The translation tier adds at most one round-trip per missing target language, and never blocks past the existing 14s request budget.
+Lingarr is **optional**. Without it, the addon behaves exactly as before. The translation tier adds at most one round-trip per missing target language, and never blocks past the existing 14s request budget. Built-in extraction runs in the background (does not block the response) and only happens when no upstream subs are present.
 
 Per-user config (configure page) wins over environment variables.
 
@@ -64,9 +64,10 @@ Per-user config (configure page) wins over environment variables.
 ```
 Stremio → Alignment Addon → Stream Addon (proxy)
                            → Sub Addon (proxy)
-                           → ffprobe (video duration)
+                           → ffprobe (video duration + text sub streams)
                            → Sub Parser (SRT/VTT/ASS)
                            → Aligner (auto offset)
+                           → ffmpeg (extract built-in text sub, background)
                            → Lingarr (optional, missing target langs)
 ```
 

@@ -21,6 +21,20 @@ import {
   getCachedTranslation, setCachedTranslation, CachedTranslation,
 } from './lingarr-cache.js';
 
+export interface BuiltinSource {
+  /**
+   * Pre-extracted text sub entries from a video file. When provided, the
+   * pipeline uses this as the translation source — preferred over upstream
+   * subs because the track timing matches the video 100%.
+   */
+  entries: SubtitleEntry[];
+  /** Source language (raw ffprobe tag like "eng", "vie", or ISO 639-1). */
+  lang: string;
+  /** For logging + cache key disambiguation. */
+  videoUrl: string;
+  streamIndex: number;
+}
+
 export interface LingarrPipelineInput {
   /** Upstream sub list (after dedupe + format detect). */
   subs: LingarrSourceSub[];
@@ -43,6 +57,12 @@ export interface LingarrPipelineInput {
   fetchSubContent?: typeof fetchText;
   /** Media type to send to Lingarr (defaults to 'Movie'). */
   mediaType?: MediaType;
+  /**
+   * Pre-extracted built-in text sub. When set, used as the translation
+   * source in preference to anything in `subs`. Bypasses upstream
+   * download + parse; saves 1 round-trip per target language.
+   */
+  builtinSource?: BuiltinSource;
 }
 
 export interface LingarrSourceSub {
@@ -130,16 +150,48 @@ export async function runLingarrPipeline(
     return { subs: input.subs, translated: false, log };
   }
 
-  const source = pickBestSource(input.subs);
-  if (!source) {
+  // Resolve translation source: built-in track wins over upstream subs.
+  // Built-in timing matches the playing video 100% (no release-mismatch risk);
+  // upstream subs may come from a different cut or encoding.
+  const builtinSource = input.builtinSource;
+  const sourceEntries = builtinSource?.entries;
+
+  // Normalized source lang (ISO 639-1) — used as Lingarr sourceLanguage param.
+  const sourceLang = builtinSource
+    ? normalizeLangForPipeline(builtinSource.lang)
+    : (() => {
+        const up = pickBestSource(input.subs);
+        return up ? (up.normLang ?? '').toLowerCase() : '';
+      })();
+
+  // Cache key: real URL for upstream; videoUrl+streamIndex for built-in
+  // (so two different videos never collide on shared upstream content).
+  const sourceCacheKey = builtinSource
+    ? `builtin:${builtinSource.videoUrl}|${builtinSource.streamIndex}`
+    : (() => {
+        const up = pickBestSource(input.subs);
+        return up ? resolveRealUrl(up.url) : '';
+      })();
+
+  if (!sourceLang || !sourceCacheKey) {
     for (const t of missingTargets) {
-      log.push({ target: t, source: '', status: 'no-source' });
+      log.push({ target: t, source: sourceLang, status: 'no-source' });
     }
     return { subs: input.subs, translated: false, log };
   }
 
-  const sourceLang = (source.normLang ?? '').toLowerCase();
-  const realSourceUrl = resolveRealUrl(source.url);
+  // Synthetic descriptor — used for cache + log + buildSyntheticSub (URL+id).
+  // The actual translation uses the raw `entries` (or fetches upstream).
+  const sourceSub: LingarrSourceSub = builtinSource
+    ? {
+        id: `builtin-${builtinSource.streamIndex}`,
+        url: sourceCacheKey,
+        lang: sourceLang,
+        format: 'srt',
+        normLang: sourceLang,
+        entries: builtinSource.entries,
+      }
+    : pickBestSource(input.subs)!;
 
   const newSubs: LingarrSourceSub[] = [];
   let translatedAny = false;
@@ -147,26 +199,34 @@ export async function runLingarrPipeline(
     if (target === sourceLang) continue;
     if (!(await ensureAvailable())) break;
 
-    // 1. Cache lookup (keyed by real URL + lang pair)
-    const cached = getCachedTranslation(realSourceUrl, sourceLang, target);
+    // 1. Cache lookup
+    const cached = getCachedTranslation(sourceCacheKey, sourceLang, target);
     if (cached) {
       log.push({ target, source: sourceLang, status: 'cache-hit' });
-      newSubs.push(buildSyntheticSub(source, target, cached));
+      newSubs.push(buildSyntheticSub(sourceSub, target, cached));
       translatedAny = true;
       continue;
     }
 
-    // 2. Download + parse source sub
-    const subContent = await fetchSubContent(realSourceUrl);
-    if (!subContent) {
-      log.push({ target, source: sourceLang, status: 'failed', detail: 'source fetch failed' });
-      continue;
-    }
-    const fmt: SubtitleFormat = source.format ?? 'srt';
-    const entries = parseSubtitle(subContent, fmt);
-    if (entries.length === 0) {
-      log.push({ target, source: sourceLang, status: 'failed', detail: 'source parse empty' });
-      continue;
+    // 2. Built-in: entries already in hand. Upstream: download + parse.
+    let entries: SubtitleEntry[];
+    let fmt: SubtitleFormat;
+    if (builtinSource) {
+      entries = builtinSource.entries;
+      fmt = 'srt';
+    } else {
+      const subContent = await fetchSubContent(sourceCacheKey);
+      if (!subContent) {
+        log.push({ target, source: sourceLang, status: 'failed', detail: 'source fetch failed' });
+        continue;
+      }
+      fmt = sourceSub.format ?? 'srt';
+      const parsed = parseSubtitle(subContent, fmt);
+      if (parsed.length === 0) {
+        log.push({ target, source: sourceLang, status: 'failed', detail: 'source parse empty' });
+        continue;
+      }
+      entries = parsed;
     }
 
     // 3. Build request and translate
@@ -182,7 +242,7 @@ export async function runLingarrPipeline(
       continue;
     }
 
-    // 4. Stitch translated lines back onto source timestamps
+    // 4. Stitch translated lines onto source timestamps
     const translatedEntries: SubtitleEntry[] = entries.map((e, i) => {
       const line = result.lines.get(i + 1);
       return {
@@ -197,13 +257,26 @@ export async function runLingarrPipeline(
       sourceLang,
       targetLang: target,
     };
-    setCachedTranslation(realSourceUrl, sourceLang, target, value);
-    newSubs.push(buildSyntheticSub(source, target, value));
+    setCachedTranslation(sourceCacheKey, sourceLang, target, value);
+    newSubs.push(buildSyntheticSub(sourceSub, target, value));
     log.push({ target, source: sourceLang, status: 'translated' });
     translatedAny = true;
   }
 
   return { subs: [...input.subs, ...newSubs], translated: translatedAny, log };
+}
+
+/** Map a raw ffprobe lang tag (e.g. "eng", "vie") to ISO 639-1 ("en", "vi"). */
+function normalizeLangForPipeline(code: string): string {
+  const c = code.trim().toLowerCase();
+  if (c.length <= 2) return c;
+  // Common 639-2/B → 639-1 (kept in sync with subtitle.ts ISO639_2_TO_1).
+  const m: Record<string, string> = {
+    eng: 'en', vie: 'vi', jpn: 'ja', kor: 'ko', zho: 'zh', tha: 'th',
+    ind: 'id', msa: 'ms', fra: 'fr', deu: 'de', spa: 'es', por: 'pt',
+    ita: 'it', rus: 'ru', ara: 'ar', hin: 'hi', tur: 'tr', pol: 'pl',
+  };
+  return m[c] ?? c;
 }
 
 /**

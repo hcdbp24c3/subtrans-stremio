@@ -8,11 +8,15 @@ import {
   calculateOffsetSmart, adjustEntries,
   isFfsubsyncAvailable,
   probeVideoInfoAsync, SmartOffsetResult, VideoProbeResult,
+  extractBuiltinSubtitle,
 } from '../lib/aligner.js';
 import { detectFileExt } from './subtitle-ext.js';
 import { createTtlStore } from '../lib/ttl-store.js';
 import { resolveRealUrl } from '../lib/proxy-resolve.js';
 import { runLingarrPipeline, LingarrSourceSub } from '../lib/lingarr-pipeline.js';
+import {
+  getCachedBuiltinSub, setCachedBuiltinSub,
+} from '../lib/builtin-sub-cache.js';
 
 const router = Router();
 
@@ -268,11 +272,23 @@ router.get('/subtitles/:type/*', async (req, res) => {
     }
   }
 
-  // Probe only when alignment still needs it AND the budget allows
+  // Probe only when alignment still needs it AND the budget allows.
+  // Also probe when Lingarr is configured and upstream sub addons return 0
+  // subs — we need textSubStreams for the built-in source fallback.
+  // We can't know the upstream result yet, so we optimistically probe
+  // when Lingarr is configured. Cost: ~1-2s for ffprobe.
+  const needProbeForTranslation = videoUrl !== null
+    && config.translateTargets.length > 0
+    && (config.subUrls.length === 0 || config.subUrls.every((u) => !u || u === 'x'));
+
   if (videoUrl && !offsetFromCache && ffsubsyncReady() && budgetLeftMs() > PROBE_MIN_MS) {
     videoProbe = await probeVideoInfoAsync(videoUrl);
     videoDuration = videoProbe.duration;
     console.log(`[subtitle] Video: filename="${videoFilename}", duration=${videoDuration != null ? `${videoDuration.toFixed(1)}s` : 'unknown'}, textSubStreams=${videoProbe.subtitleStreams.length}`);
+  } else if (videoUrl && needProbeForTranslation && budgetLeftMs() > PROBE_MIN_MS) {
+    videoProbe = await probeVideoInfoAsync(videoUrl);
+    videoDuration = videoProbe.duration;
+    console.log(`[subtitle] Video: filename="${videoFilename}", duration=${videoDuration != null ? `${videoDuration.toFixed(1)}s` : 'unknown'}, textSubStreams=${videoProbe.subtitleStreams.length} (probe for translation fallback)`);
   } else if (videoUrl) {
     console.log(`[subtitle] Video: filename="${videoFilename}", skipping probe (cache/budget)`);
   } else {
@@ -288,12 +304,62 @@ router.get('/subtitles/:type/*', async (req, res) => {
 
   console.log(`[subtitle] Fetched ${allSubs.length} subs from ${config.subUrls.length} addon(s)`);
 
-  if (allSubs.length === 0) {
+  // Built-in sub fallback: when upstream returns nothing, try to use a text
+  // track extracted from the video itself as the translation source. This
+  // makes Lingarr usable for users who have NO sub addon installed — they
+  // only need a video with a text sub track.
+  let builtinSource: { entries: SubtitleEntry[]; lang: string; videoUrl: string; streamIndex: number } | null = null;
+  if (allSubs.length === 0 && videoUrl && videoProbe && videoProbe.subtitleStreams.length > 0) {
+    const vidUrl = videoUrl; // narrow for inner closures
+    const best = videoProbe.subtitleStreams.find(
+      (s) => s.lang.startsWith('eng') || s.lang === 'en',
+    ) ?? videoProbe.subtitleStreams[0];
+
+    const cached = getCachedBuiltinSub(vidUrl, best.index);
+    if (cached) {
+      console.log(`[lingarr] builtin sub cache hit: track ${best.index} (${cached.lang}, ${cached.entries.length} entries)`);
+      builtinSource = {
+        entries: cached.entries,
+        lang: cached.lang,
+        videoUrl: vidUrl,
+        streamIndex: best.index,
+      };
+    } else {
+      // Background extract: do NOT block the response. The next /subtitles
+      // request (or a retry) will see the warmed cache. This trades a 0-sub
+      // first response for a populated cache, which is the right call when
+      // extraction is 10-30s and the user's client aborts at 20s.
+      console.log(`[lingarr] builtin sub cache miss: scheduling background extract for track ${best.index}`);
+      void extractBuiltinSubtitle(vidUrl, best.index, 60)
+        .then(async (srt) => {
+          if (!srt) {
+            console.log(`[lingarr] background extract: no content for track ${best.index}`);
+            return;
+          }
+          const entries = parseSubtitle(srt, 'srt');
+          if (entries.length === 0) {
+            console.log(`[lingarr] background extract: empty parse for track ${best.index}`);
+            return;
+          }
+          setCachedBuiltinSub(vidUrl, best.index, {
+            entries, format: 'srt', lang: best.lang,
+            streamIndex: best.index, extractedAt: Date.now(),
+          });
+          console.log(`[lingarr] background extract: cached ${entries.length} entries from track ${best.index} (${best.lang})`);
+        })
+        .catch((e: unknown) => {
+          const msg = e instanceof Error ? e.message : String(e);
+          console.log(`[lingarr] background extract error: ${msg.substring(0, 200)}`);
+        });
+    }
+  }
+
+  if (allSubs.length === 0 && !builtinSource) {
     res.json({ subtitles: [] });
     return;
   }
 
-  // 4. Filter + limit
+  // 4. Filter + limit (only meaningful for upstream subs)
   allSubs = filterByLanguage(allSubs, config.languages);
   allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
   const beforeDedupe = allSubs.length;
@@ -312,6 +378,8 @@ router.get('/subtitles/:type/*', async (req, res) => {
   //      source sub. Runs only if Lingarr is configured AND the budget allows.
   //      Translated subs are returned with pre-built `_entries`; the URL
   //      rewrite step below serves them via the existing /alignedsub endpoint.
+  //      Built-in source (from background-extracted cache) takes priority over
+  //      upstream subs when both are available.
   if (config.translateTargets.length > 0 && budgetLeftMs() >= 4_000) {
     const lingarrInput: LingarrSourceSub[] = allSubs.map((s) => ({
       id: s.id,
@@ -324,6 +392,7 @@ router.get('/subtitles/:type/*', async (req, res) => {
       subs: lingarrInput,
       config,
       budgetMs: budgetLeftMs(),
+      builtinSource: builtinSource ?? undefined,
     });
     if (lingarrOut.translated) {
       const newSubs: Subtitle[] = lingarrOut.subs

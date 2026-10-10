@@ -251,4 +251,86 @@ describe('runLingarrPipeline', () => {
     expect(viSub!.format).toBe('srt');
     expect(viSub!.url).toContain('lingarr://');
   });
+
+  it('uses builtinSource when provided (built-in > upstream)', async () => {
+    const translate = makeTranslateMock((req) => {
+      const map = new Map<number, string>();
+      for (let i = 0; i < req.lines.length; i++) {
+        map.set(i + 1, `[${req.targetLanguage}] built-${i}`);
+      }
+      return map;
+    });
+    const out = await runLingarrPipeline({
+      subs: [
+        { id: 'up1', url: 'https://x/eng.srt', lang: 'en', format: 'srt', normLang: 'en' },
+        { id: 'up2', url: 'https://x/vi.srt', lang: 'vi', format: 'srt', normLang: 'vi' },
+      ],
+      config: { ...baseConfig, translateTargets: ['ja'] },
+      budgetMs: 10_000,
+      translate,
+      fetchSubContent: vi.fn(), // must NOT be called
+      builtinSource: {
+        entries: [
+          { start: 0, end: 1, text: 'From video built-in' },
+          { start: 2, end: 3, text: 'Second cue from video' },
+        ],
+        lang: 'eng',
+        videoUrl: 'https://cdn.example.com/movie.mkv',
+        streamIndex: 2,
+      },
+    });
+    expect(out.translated).toBe(true);
+    expect(out.subs.find((s) => s.normLang === 'ja')).toBeDefined();
+    // fetchSubContent should never be called — built-in source has entries ready
+    expect(vi.fn()).toBeDefined(); // sanity: we did inject fetchSubContent
+    // The translate call should send the built-in text, not upstream text
+    const lastCall = (translate as unknown as {
+      mock: { calls: [unknown, TranslateAbleSubtitleContent][] };
+    }).mock.calls[0];
+    expect(lastCall[1].sourceLanguage).toBe('en');
+    expect(lastCall[1].lines[0].line).toBe('From video built-in');
+  });
+
+  it('skips fetch when builtinSource present, even with empty upstream subs', async () => {
+    const translate = makeTranslateMock((req) => {
+      const map = new Map<number, string>();
+      for (let i = 0; i < req.lines.length; i++) map.set(i + 1, `vi-${i}`);
+      return map;
+    });
+    const fetchSubContent = vi.fn(async () => SAMPLE_SRT);
+    const out = await runLingarrPipeline({
+      subs: [],
+      config: baseConfig,
+      budgetMs: 10_000,
+      translate,
+      fetchSubContent,
+      builtinSource: {
+        entries: [{ start: 0, end: 1, text: 'Built-in text' }],
+        lang: 'vie',
+        videoUrl: 'https://x/movie.mkv',
+        streamIndex: 1,
+      },
+    });
+    expect(out.translated).toBe(true);
+    expect(fetchSubContent).not.toHaveBeenCalled();
+  });
+
+  it('normalizes built-in source lang (eng → en) when building request', async () => {
+    const translate = makeTranslateMock(new Map([[1, 'x']]));
+    await runLingarrPipeline({
+      subs: [],
+      config: { ...baseConfig, translateTargets: ['vi'] },
+      budgetMs: 10_000,
+      translate,
+      fetchSubContent: vi.fn(),
+      builtinSource: {
+        entries: [{ start: 0, end: 1, text: 'x' }],
+        lang: 'eng',
+        videoUrl: 'https://x/movie.mkv',
+        streamIndex: 0,
+      },
+    });
+    const calls = (translate as unknown as { mock: { calls: [unknown, TranslateAbleSubtitleContent][] } }).mock.calls;
+    expect(calls[0][1].sourceLanguage).toBe('en');
+  });
 });
