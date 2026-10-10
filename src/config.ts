@@ -6,23 +6,40 @@ export interface AddonConfig {
   /** Comma-separated language codes, e.g. "en,vi,ja" — empty = all languages */
   languages: string;
   /**
-   * Lingarr server base URL (e.g. "http://localhost:9876"). When set, the addon
-   * fills missing target languages by translating the best available source sub.
-   * Falls back to env `LINGARR_URL` when empty.
+   * Translation provider name. One of: 'google' | 'deepl' | 'openai' |
+   * 'anthropic'. When set, the addon fills missing target languages by
+   * translating the best source sub via the chosen provider.
+   * Falls back to env `TRANSLATE_PROVIDER` when empty.
    */
-  lingarrUrl: string;
+  translateProvider: string;
+  /** API key for the translation provider. */
+  translateKey: string;
   /**
-   * Lingarr API key (sent as `X-Api-Key`). Falls back to env `LINGARR_API_KEY`.
-   * Omit/empty when Lingarr has authentication disabled.
+   * Optional provider base URL override (for self-hosted OpenAI-compat
+   * servers, LocalAI, Ollama, etc.). Falls back to env `TRANSLATE_BASE_URL`.
    */
-  lingarrApiKey: string;
+  translateBaseUrl: string;
+  /**
+   * Optional model name override (provider-specific). Falls back to the
+   * provider's default model when empty.
+   */
+  translateModel: string;
   /**
    * ISO 639-1 language codes the user wants available, e.g. ["vi","ja"].
    * If a target language is missing from upstream sub addons, the addon will
-   * translate a source sub via Lingarr and inject it into the response.
+   * translate a source sub via the configured provider and inject it.
    * Empty = do not auto-translate.
    */
   translateTargets: string[];
+  /**
+   * @deprecated Kept for backward-compat with manifests that still reference
+   * a hosted Lingarr instance. If `translateProvider` is empty AND
+   * `lingarrUrl` is set, the route will warn and skip translation
+   * (Lingarr is no longer supported in this addon).
+   */
+  lingarrUrl: string;
+  /** @deprecated Companion to lingarrUrl. */
+  lingarrApiKey: string;
 }
 
 export function encodeConfig(config: AddonConfig): string {
@@ -34,11 +51,15 @@ export function encodeConfig(config: AddonConfig): string {
     if (url) params.append('sub', url);
   }
   if (config.languages) params.set('lang', config.languages);
-  if (config.lingarrUrl) params.set('lingarr', config.lingarrUrl);
-  if (config.lingarrApiKey) params.set('lingarrKey', config.lingarrApiKey);
+  if (config.translateProvider) params.set('tp', config.translateProvider);
+  if (config.translateKey) params.set('tk', config.translateKey);
+  if (config.translateBaseUrl) params.set('tbu', config.translateBaseUrl);
+  if (config.translateModel) params.set('tm', config.translateModel);
   for (const code of config.translateTargets) {
     if (code) params.append('translate', code);
   }
+  if (config.lingarrUrl) params.set('lingarr', config.lingarrUrl);
+  if (config.lingarrApiKey) params.set('lingarrKey', config.lingarrApiKey);
   return params.toString();
 }
 
@@ -52,9 +73,13 @@ export function decodeConfig(queryString: string): AddonConfig | null {
       streamUrls,
       subUrls,
       languages: params.get('lang') || '',
+      translateProvider: (params.get('tp') || '').trim(),
+      translateKey: (params.get('tk') || '').trim(),
+      translateBaseUrl: (params.get('tbu') || '').trim(),
+      translateModel: (params.get('tm') || '').trim(),
+      translateTargets: params.getAll('translate').map((c) => c.trim()).filter(Boolean),
       lingarrUrl: (params.get('lingarr') || '').trim(),
       lingarrApiKey: (params.get('lingarrKey') || '').trim(),
-      translateTargets: params.getAll('translate').map((c) => c.trim()).filter(Boolean),
     };
   } catch {
     return null;
@@ -62,22 +87,40 @@ export function decodeConfig(queryString: string): AddonConfig | null {
 }
 
 /**
- * Resolve the effective Lingarr base URL. Per-user config wins; falls back to
- * env `LINGARR_URL`. Returns null when neither is set (translation disabled).
- * Trailing slashes are stripped.
+ * Resolve the effective translation provider. Per-user config wins; falls
+ * back to env `TRANSLATE_PROVIDER`. Returns null when neither is set.
  */
-export function resolveLingarrUrl(config: AddonConfig): string | null {
-  const raw = (config.lingarrUrl || process.env.LINGARR_URL || '').trim();
-  if (!raw) return null;
-  return raw.replace(/\/+$/, '');
+export function resolveTranslateProvider(config: AddonConfig): string | null {
+  const raw = (config.translateProvider || process.env.TRANSLATE_PROVIDER || '').trim();
+  return raw || null;
 }
 
 /**
- * Resolve the effective Lingarr API key. Per-user config wins; falls back to
- * env `LINGARR_API_KEY`. Returns undefined when neither is set (Lingarr likely
- * has authentication disabled — caller decides whether to send the header).
+ * Resolve the translation API key. Per-user config wins; falls back to
+ * env. Env keys are provider-specific: TRANSLATE_GOOGLE_KEY,
+ * TRANSLATE_DEEPL_KEY, TRANSLATE_OPENAI_KEY, TRANSLATE_ANTHROPIC_KEY.
+ * Generic TRANSLATE_KEY is also accepted as a fallback.
  */
-export function resolveLingarrApiKey(config: AddonConfig): string | undefined {
-  const raw = (config.lingarrApiKey || process.env.LINGARR_API_KEY || '').trim();
+export function resolveTranslateKey(
+  config: AddonConfig,
+  provider: string,
+): string | undefined {
+  const explicit = (config.translateKey || '').trim();
+  if (explicit) return explicit;
+  const generic = process.env.TRANSLATE_KEY?.trim();
+  if (generic) return generic;
+  const specific = process.env[`TRANSLATE_${provider.toUpperCase()}_KEY`]?.trim();
+  return specific || undefined;
+}
+
+/** Resolve the optional base URL override. */
+export function resolveTranslateBaseUrl(config: AddonConfig): string | undefined {
+  const raw = (config.translateBaseUrl || process.env.TRANSLATE_BASE_URL || '').trim();
+  return raw || undefined;
+}
+
+/** Resolve the optional model name override. */
+export function resolveTranslateModel(config: AddonConfig): string | undefined {
+  const raw = (config.translateModel || process.env.TRANSLATE_MODEL || '').trim();
   return raw || undefined;
 }
