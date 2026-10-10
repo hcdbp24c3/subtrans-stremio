@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { decodeConfig, encodeConfig, AddonConfig } from '../config.js';
 import { fetchJson, fetchText } from '../lib/proxy.js';
 import {
-  detectFormat, sniffFormat, parseSubtitle, SubtitleFormat
+  detectFormat, sniffFormat, parseSubtitle, SubtitleFormat, SubtitleEntry,
 } from '../lib/subtitle-parser.js';
 import {
   calculateOffsetSmart, adjustEntries,
@@ -11,6 +11,8 @@ import {
 } from '../lib/aligner.js';
 import { detectFileExt } from './subtitle-ext.js';
 import { createTtlStore } from '../lib/ttl-store.js';
+import { resolveRealUrl } from '../lib/proxy-resolve.js';
+import { runLingarrPipeline, LingarrSourceSub } from '../lib/lingarr-pipeline.js';
 
 const router = Router();
 
@@ -49,6 +51,12 @@ interface Subtitle {
   _source?: number; // index of the sub addon that provided this subtitle
   _releaseName?: string; // release name of the sub (for matching with video)
   _aligned?: boolean; // internal: body cached under aligned:<token> → /alignedsub/
+  /**
+   * Pre-built subtitle entries (translation pipeline output). When present,
+   * the route serializes them directly and serves via /alignedsub/<token>.
+   * Bypasses the normal subdownload fetch.
+   */
+  _entries?: SubtitleEntry[];
 }
 
 interface StreamResponse {
@@ -118,18 +126,6 @@ function setCache(key: string, data: { subtitles: Subtitle[] }): void {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
-
-/** Extract real download URL from SubSense local proxy URLs */
-function resolveRealUrl(url: string): string {
-  try {
-    const parsed = new URL(url);
-    const from = parsed.searchParams.get('from');
-    if (from && (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost')) {
-      return from;
-    }
-  } catch {}
-  return url;
-}
 
 async function getUpstreamBaseUrl(manifestUrl: string): Promise<string> {
   const manifest = await fetchJson<Manifest>(manifestUrl);
@@ -312,6 +308,46 @@ router.get('/subtitles/:type/*', async (req, res) => {
     _format: detectFormat(sub.url) || undefined,
   })) as Subtitle[];
 
+  // 5.5. Lingarr translation: fill missing target langs by translating the best
+  //      source sub. Runs only if Lingarr is configured AND the budget allows.
+  //      Translated subs are returned with pre-built `_entries`; the URL
+  //      rewrite step below serves them via the existing /alignedsub endpoint.
+  if (config.translateTargets.length > 0 && budgetLeftMs() >= 4_000) {
+    const lingarrInput: LingarrSourceSub[] = allSubs.map((s) => ({
+      id: s.id,
+      url: s.url,
+      lang: s.lang,
+      format: s._format,
+      normLang: s.lang ? normalizeLang(s.lang) : '',
+    }));
+    const lingarrOut = await runLingarrPipeline({
+      subs: lingarrInput,
+      config,
+      budgetMs: budgetLeftMs(),
+    });
+    if (lingarrOut.translated) {
+      const newSubs: Subtitle[] = lingarrOut.subs
+        .filter((s) => !lingarrInput.some((orig) => orig.id === s.id && orig.url === s.url))
+        .map((s) => ({
+          id: s.id,
+          url: s.url,
+          lang: s.lang,
+          _format: s.format,
+          _entries: s.entries,
+        }));
+      allSubs = [...allSubs, ...newSubs];
+      // Re-apply per-language cap so translation doesn't push out upstream subs
+      allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
+      const translatedCount = newSubs.length;
+      const cacheHitCount = lingarrOut.log.filter((l) => l.status === 'cache-hit').length;
+      const freshCount = lingarrOut.log.filter((l) => l.status === 'translated').length;
+      console.log(`[lingarr] inserted ${translatedCount} translated sub(s): ${cacheHitCount} cache, ${freshCount} fresh`);
+      for (const entry of lingarrOut.log) {
+        console.log(`[lingarr] ${entry.target} ← ${entry.source || '?'} ${entry.status}${entry.detail ? ` (${entry.detail})` : ''}`);
+      }
+    }
+  }
+
   // 6. Align: single path — ffsubsync against the VIDEO (audio/VAD).
   //    Cache offset whenever completed (including 0). If the budget runs out,
   //    respond unaligned and let alignment finish in the background (warm cache).
@@ -411,6 +447,11 @@ router.get('/subtitles/:type/*', async (req, res) => {
         alignedSubtitles = raced;
       }
     }
+  } else {
+    // No offset to apply — still need to materialize translated subs (which carry
+    // `_entries` but no body) into the alignedSubCache so the URL rewrite below
+    // can serve them via /alignedsub/<token>.<ext>.
+    alignedSubtitles = await materializeTranslatedSubs(allSubs);
   }
 
   // 8. NOW rewrite URLs to proxy format (all content downloads are done)
@@ -438,7 +479,7 @@ router.get('/subtitles/:type/*', async (req, res) => {
   // Strip internal fields — clients (Moshi/etc.) only need id/url/lang
   const result = {
     subtitles: finalSubtitles.map(
-      ({ _format, _aligned, _source, _releaseName, ...rest }) => rest,
+      ({ _format, _aligned, _source, _releaseName, _entries, ...rest }) => rest,
     ),
   };
   if (listCacheable) {
@@ -457,24 +498,30 @@ async function applyOffsetToSubtitles(subs: Subtitle[], offset: number): Promise
       const format = (sub._format || 'srt') as SubtitleFormat | null;
       if (!format) return sub;
       try {
-        const realUrl = resolveRealUrl(sub.url);
-        const subContent = await fetchText(realUrl);
-        if (!subContent) return sub;
-
         let adjustedContent: string | null = null;
-        if (format === 'ass') {
-          // Nuvio Android cannot parse ASS (ICU regex crash on unescaped }).
-          // Convert to SRT after offsetting.
-          const entries = parseSubtitle(subContent, 'ass');
-          if (entries.length > 0) {
-            adjustedContent = reSerialize(adjustEntries(entries, offset), 'srt');
-          }
+        if (sub._entries && sub._entries.length > 0) {
+          // Translation pipeline already built entries — apply offset, re-serialize.
+          // ASS body is always converted to SRT (Nuvio ICU-safe).
+          const adjusted = adjustEntries(sub._entries, offset);
+          adjustedContent = reSerialize(adjusted, format === 'ass' ? 'srt' : format);
         } else {
-          // SRT/VTT: parse → adjust → re-serialize
-          const entries = parseSubtitle(subContent, format);
-          if (entries.length > 0) {
-            const adjusted = adjustEntries(entries, offset);
-            adjustedContent = reSerialize(adjusted, format === 'vtt' ? 'srt' : format);
+          const realUrl = resolveRealUrl(sub.url);
+          const subContent = await fetchText(realUrl);
+          if (!subContent) return sub;
+          if (format === 'ass') {
+            // Nuvio Android cannot parse ASS (ICU regex crash on unescaped }).
+            // Convert to SRT after offsetting.
+            const entries = parseSubtitle(subContent, 'ass');
+            if (entries.length > 0) {
+              adjustedContent = reSerialize(adjustEntries(entries, offset), 'srt');
+            }
+          } else {
+            // SRT/VTT: parse → adjust → re-serialize
+            const entries = parseSubtitle(subContent, format);
+            if (entries.length > 0) {
+              const adjusted = adjustEntries(entries, offset);
+              adjustedContent = reSerialize(adjusted, format === 'vtt' ? 'srt' : format);
+            }
           }
         }
 
@@ -500,6 +547,36 @@ async function applyOffsetToSubtitles(subs: Subtitle[], offset: number): Promise
       return sub;
     }),
   );
+}
+
+/**
+ * Serialize pre-built `_entries` from the translation pipeline into
+ * alignedSubCache so the URL rewrite step can serve them as HTTP bodies.
+ * Subs without `_entries` (regular upstream subs) are passed through.
+ * ASS is always converted to SRT for Nuvio Android safety.
+ */
+async function materializeTranslatedSubs(subs: Subtitle[]): Promise<Subtitle[]> {
+  const out: Subtitle[] = [];
+  for (const sub of subs) {
+    if (!sub._entries || sub._entries.length === 0) {
+      out.push(sub);
+      continue;
+    }
+    const format = (sub._format || 'srt') as SubtitleFormat;
+    const content = reSerialize(sub._entries, format === 'ass' ? 'srt' : format);
+    if (!content) {
+      out.push(sub);
+      continue;
+    }
+    const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+    alignedSubCache.set(
+      token,
+      { body: Buffer.from(content, 'utf-8'), contentType: 'text/plain; charset=utf-8' },
+      ALIGNED_SUB_TTL_MS,
+    );
+    out.push({ ...sub, url: `aligned:${token}`, _aligned: true });
+  }
+  return out;
 }
 
 // ── Aligned subtitle content endpoint ──────────────────────────────

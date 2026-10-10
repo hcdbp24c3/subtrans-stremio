@@ -130,6 +130,14 @@
     }
     .lang-actions button:hover { border-color: #e94560; color: #eee; }
     .lang-hint { font-size: 11px; color: #666; margin-top: 8px; }
+    .optional-tag { font-weight: 400; font-size: 11px; color: #4ecca3; margin-left: 6px; }
+    .lingarr-config { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+    .lingarr-config input {
+      width: 100%; padding: 10px 12px; font: inherit; color: #eee;
+      background: #0f3460; border: 1px solid #1a4a7e; border-radius: 8px;
+    }
+    .lingarr-config input::placeholder { color: #6688aa; }
+    .lingarr-config input:focus { outline: none; border-color: #e94560; }
 
     /* Generate + open buttons */
     .btn-generate {
@@ -213,6 +221,30 @@
         </div>
       </div>
       <div class="lang-hint">Search &amp; multi-select. Empty = all languages. Max 5 subs per language.</div>
+    </div>
+
+    <div class="lang-section">
+      <label for="translateSearch">Translation (Lingarr) <span class="optional-tag">optional</span></label>
+      <div class="lingarr-config">
+        <input type="text" id="lingarrUrl" placeholder="Lingarr URL, e.g. http://localhost:9876" autocomplete="off">
+        <input type="password" id="lingarrKey" placeholder="API key (only if Lingarr auth is enabled)" autocomplete="off">
+      </div>
+      <div class="lang-select" id="translateSelect">
+        <div class="lang-control" id="translateControl" onclick="toggleTranslateDropdown(event)">
+          <span class="lang-placeholder" id="translatePlaceholder">Pick languages to auto-translate (leave empty to skip)</span>
+        </div>
+        <span class="lang-caret">▼</span>
+        <div class="lang-dropdown" id="translateDropdown" onclick="event.stopPropagation()">
+          <input class="lang-search" id="translateSearch" type="text" placeholder="Search languages… (English, code)"
+                 autocomplete="off" oninput="filterTranslateLangs()" onkeydown="onTranslateSearchKey(event)">
+          <div class="lang-options" id="translateOptions"></div>
+          <div class="lang-actions">
+            <button type="button" onclick="clearTranslateLangs()">Clear all</button>
+            <button type="button" onclick="closeTranslateDropdown()">Done</button>
+          </div>
+        </div>
+      </div>
+      <div class="lang-hint">Fills missing target languages by translating the best source sub via your <a href="https://github.com/lingarr-translate/lingarr" target="_blank" rel="noopener" style="color:#4ecca3">Lingarr</a> instance. Source sub is picked automatically (English preferred).</div>
     </div>
 
     <button class="btn-generate" onclick="generate()">Generate Manifest URL</button>
@@ -458,6 +490,7 @@
     ].sort((a, b) => a.label.localeCompare(b.label));
 
     const selectedLangs = new Set();
+    const selectedTranslateLangs = new Set();
     let currentManifestUrl = '';
 
     // ── Language multi-select ──────────────────────────────────
@@ -582,7 +615,103 @@
     document.addEventListener('click', (e) => {
       const sel = document.getElementById('langSelect');
       if (sel && !sel.contains(e.target)) closeLangDropdown();
+      const trSel = document.getElementById('translateSelect');
+      if (trSel && !trSel.contains(e.target)) closeTranslateDropdown();
     });
+
+    // ── Translate multi-select (separate from language filter) ───
+    function initTranslateOptions(filter = '') {
+      const box = document.getElementById('translateOptions');
+      const q = filter.trim().toLowerCase();
+      box.innerHTML = '';
+      const list = q
+        ? LANGUAGES.filter(l =>
+            l.label.toLowerCase().includes(q) || l.code.toLowerCase() === q ||
+            l.code.toLowerCase().startsWith(q))
+        : LANGUAGES;
+      if (list.length === 0) {
+        box.innerHTML = '<div class="lang-opt" style="color:#666">No matches</div>';
+        return;
+      }
+      const frag = document.createDocumentFragment();
+      list.forEach(lang => {
+        const row = document.createElement('label');
+        row.className = 'lang-opt' + (selectedTranslateLangs.has(lang.code) ? ' selected' : '');
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = selectedTranslateLangs.has(lang.code);
+        cb.onchange = () => toggleTranslateLang(lang.code, cb.checked);
+        const name = document.createElement('span');
+        name.textContent = lang.label;
+        const code = document.createElement('span');
+        code.className = 'code';
+        code.textContent = lang.code;
+        row.append(cb, name, code);
+        frag.appendChild(row);
+      });
+      box.appendChild(frag);
+    }
+
+    function toggleTranslateLang(code, on) {
+      if (on) selectedTranslateLangs.add(code);
+      else selectedTranslateLangs.delete(code);
+      renderTranslateTags();
+    }
+
+    function renderTranslateTags() {
+      const control = document.getElementById('translateControl');
+      const placeholder = document.getElementById('translatePlaceholder');
+      control.querySelectorAll('.lang-tag').forEach(el => el.remove());
+      if (selectedTranslateLangs.size === 0) {
+        placeholder.style.display = '';
+        return;
+      }
+      placeholder.style.display = 'none';
+      const byCode = Object.fromEntries(LANGUAGES.map(l => [l.code, l.label]));
+      Array.from(selectedTranslateLangs).forEach(code => {
+        const tag = document.createElement('span');
+        tag.className = 'lang-tag';
+        tag.innerHTML = `${byCode[code] || code}<button type="button" title="Remove" data-code="${code}">×</button>`;
+        tag.querySelector('button').onclick = (e) => {
+          e.stopPropagation();
+          selectedTranslateLangs.delete(code);
+          renderTranslateTags();
+          initTranslateOptions(document.getElementById('translateSearch').value);
+        };
+        control.appendChild(tag);
+      });
+    }
+
+    function toggleTranslateDropdown(e) {
+      if (e) e.stopPropagation();
+      const sel = document.getElementById('translateSelect');
+      const open = !sel.classList.contains('open');
+      sel.classList.toggle('open', open);
+      if (open) {
+        const search = document.getElementById('translateSearch');
+        search.value = '';
+        initTranslateOptions('');
+        setTimeout(() => search.focus(), 50);
+      }
+    }
+
+    function closeTranslateDropdown() {
+      document.getElementById('translateSelect').classList.remove('open');
+    }
+
+    function clearTranslateLangs() {
+      selectedTranslateLangs.clear();
+      renderTranslateTags();
+      initTranslateOptions(document.getElementById('translateSearch').value);
+    }
+
+    function filterTranslateLangs() {
+      initTranslateOptions(document.getElementById('translateSearch').value);
+    }
+
+    function onTranslateSearchKey(e) {
+      if (e.key === 'Escape') closeTranslateDropdown();
+    }
 
     // ── Tab switching ──────────────────────────────────────────
     function switchTab(tab) {
@@ -644,6 +773,13 @@
       getAddonUrls('sub').forEach(url => params.append('sub', url));
       if (selectedLangs.size > 0) {
         params.set('lang', Array.from(selectedLangs).join(','));
+      }
+      const lingarrUrl = document.getElementById('lingarrUrl').value.trim();
+      const lingarrKey = document.getElementById('lingarrKey').value.trim();
+      if (lingarrUrl) params.set('lingarr', lingarrUrl);
+      if (lingarrKey) params.set('lingarrKey', lingarrKey);
+      if (selectedTranslateLangs.size > 0) {
+        Array.from(selectedTranslateLangs).forEach(code => params.append('translate', code));
       }
       return params.toString();
     }
@@ -753,6 +889,9 @@
       const streams = p.getAll('stream').filter(Boolean);
       const subs = p.getAll('sub').filter(Boolean);
       const langs = (p.get('lang') || '').split(',').map(s => s.trim()).filter(Boolean);
+      const lingarrUrl = p.get('lingarr') || '';
+      const lingarrKey = p.get('lingarrKey') || '';
+      const translateLangs = p.getAll('translate').map(s => s.trim()).filter(Boolean);
 
       if (streams.length) setAddonUrls('stream', streams);
       if (subs.length) setAddonUrls('sub', subs);
@@ -760,6 +899,12 @@
       langs.forEach(code => selectedLangs.add(code));
       renderLangTags();
       initLanguageOptions('');
+
+      if (lingarrUrl) document.getElementById('lingarrUrl').value = lingarrUrl;
+      if (lingarrKey) document.getElementById('lingarrKey').value = lingarrKey;
+      translateLangs.forEach(code => selectedTranslateLangs.add(code));
+      renderTranslateTags();
+      initTranslateOptions('');
 
       document.getElementById('reconfigBadge').classList.add('show');
 
@@ -780,6 +925,7 @@
 
     // ── Init ───────────────────────────────────────────────────
     initLanguageOptions('');
+    initTranslateOptions('');
     addAddon('stream');
     addAddon('sub');
     loadConfigFromUrl();
