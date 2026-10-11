@@ -43,12 +43,25 @@ Open http://localhost:5100/configure
 
 The addon can fill missing target languages by translating the best source sub via a provider. Pick one in `/configure`:
 
-| Provider | Free tier | Notes |
-|---|---|---|
-| **Google Translate** | 500K chars/month | Easiest setup, [get API key](https://console.cloud.google.com/apis/credentials) |
-| **DeepL** | 500K chars/month (`:fx` key) | High quality for European langs. Free key ends with `:fx` (auto-detected) |
-| **OpenAI** | none | `gpt-4o-mini` default. Also works with OpenRouter / Mistral / xAI / LocalAI / Ollama via **Base URL** field |
-| **Anthropic** | none | `claude-haiku-4-5` default |
+**Free / cheap:**
+- **Google Translate** — 500K chars/month free, [get API key](https://console.cloud.google.com/apis/credentials)
+- **DeepL** — 500K chars/month free with `:fx` key (auto-detected), high quality for European langs
+- **LibreTranslate** — open-source, self-hostable, free (public instances often rate-limited)
+- **Ollama** — local LLM, free, runs on your hardware (`http://localhost:11434`)
+
+**LLM providers (paid):**
+- **OpenAI** — `gpt-4o-mini` default
+- **Anthropic** — `claude-haiku-4-5` default
+- **Google Gemini** — `gemini-2.0-flash` default
+- **Mistral AI** — `mistral-small-latest` default
+- **xAI (Grok)** — `grok-2-latest` default
+- **OpenRouter** — multi-model proxy, requires user-specified model
+
+**Paid / legacy:**
+- **Microsoft Bing Translator** — requires Azure subscription
+- **Yandex Translate** — requires Yandex Cloud subscription
+
+Self-hosted OpenAI-compatible servers (LocalAI, Ollama, vLLM, LM Studio) all work via the **Base URL** field with the OpenAI / Mistral / xAI / OpenRouter / Ollama / Gemini provider entry.
 
 The pipeline:
 
@@ -61,8 +74,6 @@ The pipeline:
 Translation is **optional**. Without it, the addon behaves exactly as before. The translation tier adds at most one round-trip per missing target language, and never blocks past the existing 14s request budget. Built-in extraction runs in the background (does not block the response) and only happens when no upstream subs are present.
 
 Per-user config (configure page) wins over environment variables.
-
-**Self-hosted OpenAI-compatible servers** (LocalAI, Ollama, vLLM): set **Base URL** to your server (e.g. `http://localhost:11434` for Ollama). The model field is optional — provider default is used if blank.
 
 ## Supported Formats
 

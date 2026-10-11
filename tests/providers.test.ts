@@ -3,6 +3,11 @@ import { openaiProvider, OPENAI_DEFAULT_MODEL } from '../src/lib/providers/opena
 import { anthropicProvider } from '../src/lib/providers/anthropic.js';
 import { deeplProvider } from '../src/lib/providers/deepl.js';
 import { googleProvider } from '../src/lib/providers/google.js';
+import { geminiProvider } from '../src/lib/providers/gemini.js';
+import { libretranslateProvider } from '../src/lib/providers/libretranslate.js';
+import { bingProvider } from '../src/lib/providers/bing.js';
+import { yandexProvider } from '../src/lib/providers/yandex.js';
+import { mistralProvider, xaiProvider } from '../src/lib/providers/openai-compat.js';
 import { buildChatPrompt, parseChatResponse } from '../src/lib/providers/_helpers.js';
 import { SubtitleEntry } from '../src/lib/subtitle-parser.js';
 
@@ -203,5 +208,171 @@ describe('googleProvider', () => {
     expect(body.q).toEqual(['Hello', 'How are you']);
     expect(body.source).toBe('en');
     expect(body.target).toBe('vi');
+  });
+});
+
+describe('geminiProvider (OpenAI-compat)', () => {
+  let originalFetch: typeof fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it('delegates to OpenAI with default Gemini base + model', async () => {
+    const mock = mockFetchOk((m) => m.mockResolvedValueOnce(
+      new Response(JSON.stringify({ choices: [{ message: { content: '1. Xin' } }] }), { status: 200 }),
+    ));
+    await geminiProvider.translate(
+      { apiKey: 'AIza-gemini', timeoutMs: 5000 },
+      { sourceLanguage: 'en', targetLanguage: 'vi', lines: SAMPLE_ENTRIES },
+    );
+    const [url, init] = (mock.mock.calls[0] ?? []) as [string, RequestInit];
+    expect(url).toBe('https://generativelanguage.googleapis.com/v1/chat/completions');
+    const headers = (init.headers ?? {}) as Record<string, string>;
+    expect(headers['Authorization']).toBe('Bearer AIza-gemini');
+    const body = JSON.parse(String(init.body)) as { model: string };
+    expect(body.model).toBe('gemini-2.0-flash');
+  });
+});
+
+describe('openai-compat providers (Mistral, xAI)', () => {
+  let originalFetch: typeof fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it('mistralProvider uses its default base + model', async () => {
+    const mock = mockFetchOk((m) => m.mockResolvedValueOnce(
+      new Response(JSON.stringify({ choices: [{ message: { content: '1. x' } }] }), { status: 200 }),
+    ));
+    await mistralProvider.translate(
+      { apiKey: 'msk', timeoutMs: 5000 },
+      { sourceLanguage: 'en', targetLanguage: 'vi', lines: SAMPLE_ENTRIES },
+    );
+    const [url, init] = (mock.mock.calls[0] ?? []) as [string, RequestInit];
+    expect(url).toBe('https://api.mistral.ai/v1/chat/completions');
+    const body = JSON.parse(String(init.body)) as { model: string };
+    expect(body.model).toBe('mistral-small-latest');
+  });
+
+  it('xaiProvider uses its default base + model', async () => {
+    const mock = mockFetchOk((m) => m.mockResolvedValueOnce(
+      new Response(JSON.stringify({ choices: [{ message: { content: '1. x' } }] }), { status: 200 }),
+    ));
+    await xaiProvider.translate(
+      { apiKey: 'xai-key', timeoutMs: 5000 },
+      { sourceLanguage: 'en', targetLanguage: 'vi', lines: SAMPLE_ENTRIES },
+    );
+    const [url, init] = (mock.mock.calls[0] ?? []) as [string, RequestInit];
+    expect(url).toBe('https://api.x.ai/v1/chat/completions');
+    const body = JSON.parse(String(init.body)) as { model: string };
+    expect(body.model).toBe('grok-2-latest');
+  });
+});
+
+describe('libretranslateProvider', () => {
+  let originalFetch: typeof fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it('sends array body with one entry per text and parses object response', async () => {
+    const mock = mockFetchOk((m) => m.mockImplementation(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = init?.body ? JSON.parse(String(init.body)) as { q: string } : { q: '' };
+      const text = body.q === 'Hello' ? 'Xin' : 'Chao';
+      return new Response(JSON.stringify({ translatedText: text }), { status: 200 });
+    }));
+    const result = await libretranslateProvider.translate(
+      { apiKey: '', timeoutMs: 5000 },
+      { sourceLanguage: 'en', targetLanguage: 'vi', lines: SAMPLE_ENTRIES },
+    );
+    expect(result.ok).toBe(true);
+    expect(result.lines.get(1)).toBe('Xin');
+    expect(result.lines.get(2)).toBe('Chao');
+    expect(mock.mock.calls.length).toBe(2);
+    const [url, init] = (mock.mock.calls[0] ?? []) as [string, RequestInit];
+    expect(url).toContain('libretranslate.com/translate');
+    // source/target are in the body, not query string
+    const firstBody = JSON.parse(String(init.body)) as { q: string; format: string; source: string; target: string };
+    expect(firstBody.q).toBe('Hello');
+    expect(firstBody.format).toBe('text');
+    expect(firstBody.source).toBe('en');
+    expect(firstBody.target).toBe('vi');
+  });
+
+  it('passes api_key in body when set', async () => {
+    const mock = mockFetchOk((m) => m.mockResolvedValue(
+      new Response(JSON.stringify({ translatedText: 'x' }), { status: 200 }),
+    ));
+    await libretranslateProvider.translate(
+      { apiKey: 'lt-key', timeoutMs: 5000 },
+      { sourceLanguage: 'en', targetLanguage: 'vi', lines: SAMPLE_ENTRIES },
+    );
+    expect(mock.mock.calls.length).toBeGreaterThan(0);
+    const init = (mock.mock.calls[0]?.[1] ?? {}) as RequestInit;
+    const body = JSON.parse(String(init.body)) as { api_key?: string };
+    expect(body.api_key).toBe('lt-key');
+  });
+
+  it('returns ok=false when all requests fail', async () => {
+    mockFetchOk((m) => m.mockResolvedValue(new Response('forbidden', { status: 403 })));
+    const result = await libretranslateProvider.translate(
+      { apiKey: '', timeoutMs: 5000 },
+      { sourceLanguage: 'en', targetLanguage: 'vi', lines: SAMPLE_ENTRIES },
+    );
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/403/);
+  });
+});
+
+describe('bingProvider', () => {
+  let originalFetch: typeof fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it('sends Ocp-Apim-Subscription-Key + array body', async () => {
+    const mock = mockFetchOk((m) => m.mockResolvedValueOnce(
+      new Response(JSON.stringify([
+        { translations: [{ text: 'Xin chào', to: 'vi' }] },
+        { translations: [{ text: 'Bạn khỏe không', to: 'vi' }] },
+      ]), { status: 200 }),
+    ));
+    const result = await bingProvider.translate(
+      { apiKey: 'bing-key', timeoutMs: 5000 },
+      { sourceLanguage: 'en', targetLanguage: 'vi', lines: SAMPLE_ENTRIES },
+    );
+    expect(result.ok).toBe(true);
+    expect(result.lines.get(1)).toBe('Xin chào');
+    const [url, init] = (mock.mock.calls[0] ?? []) as [string, RequestInit];
+    expect(url).toContain('api-version=3.0');
+    expect(url).toContain('from=en&to=vi');
+    const headers = (init.headers ?? {}) as Record<string, string>;
+    expect(headers['Ocp-Apim-Subscription-Key']).toBe('bing-key');
+    const body = JSON.parse(String(init.body)) as { Text: string }[];
+    expect(body[0].Text).toBe('Hello');
+    expect(body[1].Text).toBe('How are you');
+  });
+});
+
+describe('yandexProvider', () => {
+  let originalFetch: typeof fetch;
+  beforeEach(() => { originalFetch = globalThis.fetch; });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it('sends Api-Key header + texts array', async () => {
+    const mock = mockFetchOk((m) => m.mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        translations: [{ text: 'Xin' }, { text: 'Chao' }],
+      }), { status: 200 }),
+    ));
+    const result = await yandexProvider.translate(
+      { apiKey: 'yc-key', timeoutMs: 5000 },
+      { sourceLanguage: 'en', targetLanguage: 'vi', lines: SAMPLE_ENTRIES },
+    );
+    expect(result.ok).toBe(true);
+    expect(result.lines.get(1)).toBe('Xin');
+    const [url, init] = (mock.mock.calls[0] ?? []) as [string, RequestInit];
+    expect(url).toBe('https://translate.api.cloud.yandex.net/translate/v2/translate');
+    const headers = (init.headers ?? {}) as Record<string, string>;
+    expect(headers['Authorization']).toBe('Api-Key yc-key');
+    const body = JSON.parse(String(init.body)) as { sourceLanguageCode: string; texts: string[] };
+    expect(body.sourceLanguageCode).toBe('en');
+    expect(body.texts).toEqual(['Hello', 'How are you']);
   });
 });

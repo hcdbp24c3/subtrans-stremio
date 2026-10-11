@@ -132,12 +132,27 @@
     .lang-hint { font-size: 11px; color: #666; margin-top: 8px; }
     .optional-tag { font-weight: 400; font-size: 11px; color: #4ecca3; margin-left: 6px; }
     .lingarr-config { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
-    .lingarr-config input {
+    .lingarr-config input,
+    .lingarr-config select {
       width: 100%; padding: 10px 12px; font: inherit; color: #eee;
       background: #0f3460; border: 1px solid #1a4a7e; border-radius: 8px;
     }
-    .lingarr-config input::placeholder { color: #6688aa; }
-    .lingarr-config input:focus { outline: none; border-color: #e94560; }
+    .lingarr-config select {
+      /* native arrow rendered as inline SVG; matches dark theme */
+      appearance: none;
+      -webkit-appearance: none;
+      background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' stroke='%23eee' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+      background-repeat: no-repeat;
+      background-position: right 12px center;
+      background-size: 12px 12px;
+      padding-right: 36px;
+      cursor: pointer;
+    }
+    .lingarr-config input::placeholder,
+    .lingarr-config select option { color: #6688aa; }
+    .lingarr-config input:focus,
+    .lingarr-config select:focus { outline: none; border-color: #e94560; }
+    .lingarr-config option { background: #0f3460; color: #eee; }
 
     /* Generate + open buttons */
     .btn-generate {
@@ -228,12 +243,26 @@
       <div class="lingarr-config">
         <select id="translateProvider" autocomplete="off">
           <option value="">— select provider —</option>
-          <option value="google">Google Translate (500K free/month)</option>
-          <option value="deepl">DeepL (500K free/month with :fx key)</option>
-          <option value="openai">OpenAI / OpenRouter / Mistral / xAI / LocalAI / Ollama</option>
-          <option value="anthropic">Anthropic Claude</option>
+          <optgroup label="Free / cheap">
+            <option value="google">Google Translate (500K chars/month)</option>
+            <option value="deepl">DeepL (500K chars/month with :fx key)</option>
+            <option value="libretranslate">LibreTranslate (self-host, free)</option>
+            <option value="ollama">Ollama (local, free)</option>
+          </optgroup>
+          <optgroup label="LLM providers (paid)">
+            <option value="openai">OpenAI (gpt-4o-mini)</option>
+            <option value="anthropic">Anthropic Claude (haiku-4-5)</option>
+            <option value="gemini">Google Gemini (gemini-2.0-flash)</option>
+            <option value="mistral">Mistral AI (mistral-small)</option>
+            <option value="xai">xAI Grok</option>
+            <option value="openrouter">OpenRouter (multi-model)</option>
+          </optgroup>
+          <optgroup label="Paid / legacy">
+            <option value="bing">Microsoft Bing Translator</option>
+            <option value="yandex">Yandex Translate</option>
+          </optgroup>
         </select>
-        <input type="password" id="translateKey" placeholder="API key" autocomplete="off">
+        <input type="password" id="translateKey" placeholder="API key (leave blank for self-hosted Ollama/LibreTranslate)" autocomplete="off">
         <input type="text" id="translateBaseUrl" placeholder="Base URL (only for self-hosted, e.g. http://localhost:11434)" autocomplete="off">
         <input type="text" id="translateModel" placeholder="Model (optional, provider default used if blank)" autocomplete="off">
       </div>
