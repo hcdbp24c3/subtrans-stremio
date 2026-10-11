@@ -306,15 +306,16 @@ export async function extractBuiltinSubtitle(
     }
     console.log(`[aligner] probe: track ${streamIndex} first packet at byte ${firstPos}`);
 
-    // Best-effort foreground extract: small window (~32 MB) starting at
-    // the cluster header. If the actual sub data is past the window,
-    // ffmpeg reports "Stream map matches no streams" and we return null
-    // so the route schedules a background extract. Most of the
-    // 30s budget goes to the background path on the second request.
-    const WINDOW = 32 * 1024 * 1024; // 32 MB
+    // Best-effort foreground extract: medium window (256 MB) starting at
+    // the cluster header. For 30-80 GB REMUXes, sub track data can
+    // sit 200-500 MB past the first packet position. 256 MB covers the
+    // easy cases (sub cluster within 200 MB of packet position); 1 GB
+    // would cover most REMUXes but is too slow. When this fails the
+    // route falls back to a background full extract.
+    const WINDOW = 256 * 1024 * 1024; // 256 MB
     const rangeStart = Math.max(0, firstPos - 64 * 1024);
     const rangeEnd = rangeStart + WINDOW - 1;
-    const curlBudget = Math.max(6, Math.min(12, timeoutSec - 2));
+    const curlBudget = Math.max(15, Math.min(25, timeoutSec - 5));
     const curlCmd =
       `timeout ${curlBudget} curl -sSL ` +
       `-A "Mozilla/5.0" ` +
