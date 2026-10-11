@@ -242,29 +242,29 @@
       <label for="translateSearch">Translation <span class="optional-tag">optional</span></label>
       <div class="lingarr-config">
         <select id="translateProvider" autocomplete="off">
-          <option value="">— select provider —</option>
+          <option value="" data-needs-key="false" data-needs-base="false" data-needs-model="false">— select provider —</option>
           <optgroup label="Free / cheap">
-            <option value="google">Google Translate (500K chars/month)</option>
-            <option value="deepl">DeepL (500K chars/month with :fx key)</option>
-            <option value="libretranslate">LibreTranslate (self-host, free)</option>
-            <option value="ollama">Ollama (local, free)</option>
+            <option value="google" data-needs-key="true" data-needs-base="false" data-needs-model="false">Google Translate (500K chars/month)</option>
+            <option value="deepl" data-needs-key="true" data-needs-base="false" data-needs-model="false">DeepL (500K chars/month with :fx key)</option>
+            <option value="libretranslate" data-needs-key="false" data-needs-base="true" data-needs-model="false">LibreTranslate (self-host, free)</option>
+            <option value="ollama" data-needs-key="false" data-needs-base="true" data-needs-model="true">Ollama (local, free)</option>
           </optgroup>
           <optgroup label="LLM providers (paid)">
-            <option value="openai">OpenAI (gpt-4o-mini)</option>
-            <option value="anthropic">Anthropic Claude (haiku-4-5)</option>
-            <option value="gemini">Google Gemini (gemini-2.0-flash)</option>
-            <option value="mistral">Mistral AI (mistral-small)</option>
-            <option value="xai">xAI Grok</option>
-            <option value="openrouter">OpenRouter (multi-model)</option>
+            <option value="openai" data-needs-key="true" data-needs-base="false" data-needs-model="false">OpenAI (gpt-4o-mini)</option>
+            <option value="anthropic" data-needs-key="true" data-needs-base="false" data-needs-model="false">Anthropic Claude (haiku-4-5)</option>
+            <option value="gemini" data-needs-key="true" data-needs-base="false" data-needs-model="false">Google Gemini (gemini-2.0-flash)</option>
+            <option value="mistral" data-needs-key="true" data-needs-base="false" data-needs-model="false">Mistral AI (mistral-small)</option>
+            <option value="xai" data-needs-key="true" data-needs-base="false" data-needs-model="false">xAI Grok</option>
+            <option value="openrouter" data-needs-key="true" data-needs-base="false" data-needs-model="false">OpenRouter (multi-model)</option>
           </optgroup>
           <optgroup label="Paid / legacy">
-            <option value="bing">Microsoft Bing Translator</option>
-            <option value="yandex">Yandex Translate</option>
+            <option value="bing" data-needs-key="true" data-needs-base="false" data-needs-model="false">Microsoft Bing Translator</option>
+            <option value="yandex" data-needs-key="true" data-needs-base="false" data-needs-model="false">Yandex Translate</option>
           </optgroup>
         </select>
-        <input type="password" id="translateKey" placeholder="API key (leave blank for self-hosted Ollama/LibreTranslate)" autocomplete="off">
-        <input type="text" id="translateBaseUrl" placeholder="Base URL (only for self-hosted, e.g. http://localhost:11434)" autocomplete="off">
-        <input type="text" id="translateModel" placeholder="Model (optional, provider default used if blank)" autocomplete="off">
+        <input type="password" id="translateKey" placeholder="API key" autocomplete="off" hidden>
+        <input type="text" id="translateBaseUrl" placeholder="Base URL (e.g. http://localhost:11434 for Ollama)" autocomplete="off" hidden>
+        <input type="text" id="translateModel" placeholder="Model (optional, e.g. llama3.1:8b)" autocomplete="off" hidden>
       </div>
       <div class="lang-select" id="translateSelect">
         <div class="lang-control" id="translateControl" onclick="toggleTranslateDropdown(event)">
@@ -736,6 +736,30 @@
       document.getElementById('translateSelect').classList.remove('open');
     }
 
+    // Show/hide API key / Base URL / Model fields based on selected provider's
+    // data-needs-* attributes. Self-hosted providers (Ollama, LibreTranslate)
+    // don't need a key; paid providers don't need a custom Base URL; etc.
+    function updateTranslateFields() {
+      const sel = document.getElementById('translateProvider');
+      const opt = sel.selectedOptions[0];
+      const provider = sel.value;
+      const keyInput = document.getElementById('translateKey');
+      const baseInput = document.getElementById('translateBaseUrl');
+      const modelInput = document.getElementById('translateModel');
+      if (!provider || !opt) {
+        keyInput.hidden = true;
+        baseInput.hidden = true;
+        modelInput.hidden = true;
+        return;
+      }
+      const needsKey = opt.getAttribute('data-needs-key') === 'true';
+      const needsBase = opt.getAttribute('data-needs-base') === 'true';
+      const needsModel = opt.getAttribute('data-needs-model') === 'true';
+      keyInput.hidden = !needsKey;
+      baseInput.hidden = !needsBase;
+      modelInput.hidden = !needsModel;
+    }
+
     function clearTranslateLangs() {
       selectedTranslateLangs.clear();
       renderTranslateTags();
@@ -950,6 +974,7 @@
       translateLangs.forEach(code => selectedTranslateLangs.add(code));
       renderTranslateTags();
       initTranslateOptions('');
+      updateTranslateFields();
 
       document.getElementById('reconfigBadge').classList.add('show');
 
@@ -973,6 +998,8 @@
     initTranslateOptions('');
     addAddon('stream');
     addAddon('sub');
+    document.getElementById('translateProvider').addEventListener('change', updateTranslateFields);
+    updateTranslateFields();
     loadConfigFromUrl();
   </script>
 </body>
