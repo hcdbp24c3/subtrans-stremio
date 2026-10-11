@@ -306,16 +306,15 @@ export async function extractBuiltinSubtitle(
     }
     console.log(`[aligner] probe: track ${streamIndex} first packet at byte ${firstPos}`);
 
-    // Best-effort foreground extract: medium window (256 MB) starting at
-    // the cluster header. For 30-80 GB REMUXes, sub track data can
-    // sit 200-500 MB past the first packet position. 256 MB covers the
-    // easy cases (sub cluster within 200 MB of packet position); 1 GB
-    // would cover most REMUXes but is too slow. When this fails the
-    // route falls back to a background full extract.
-    const WINDOW = 256 * 1024 * 1024; // 256 MB
-    const rangeStart = Math.max(0, firstPos - 64 * 1024);
-    const rangeEnd = rangeStart + WINDOW - 1;
-    const curlBudget = Math.max(15, Math.min(25, timeoutSec - 5));
+    // Best-effort foreground extract: 1 GB window from byte 0. mkvextract
+    // (replacing the previous ffmpeg) can extract sub tracks from a partial
+    // file as long as the partial file has the EBML header + the
+    // sub track's cluster data. For 30-80 GB REMUXes, 1 GB usually
+    // covers the sub cluster for the first dialogue cue.
+    const WINDOW = 1024 * 1024 * 1024; // 1 GB
+    const rangeStart = 0;
+    const rangeEnd = WINDOW - 1;
+    const curlBudget = Math.max(20, Math.min(45, timeoutSec - 5));
     const curlCmd =
       `timeout ${curlBudget} curl -sSL ` +
       `-A "Mozilla/5.0" ` +
@@ -323,7 +322,7 @@ export async function extractBuiltinSubtitle(
       `--max-time ${curlBudget - 1} ` +
       `-o "${partialFile}" ` +
       `"${safeUrl}" 2>"${stderrFile}"`;
-    console.log(`[aligner] foreground: trying ${WINDOW / 1024 / 1024} MB window at offset ${rangeStart} (${curlBudget}s budget)...`);
+    console.log(`[aligner] foreground: trying ${WINDOW / 1024 / 1024 / 1024} GB window (${curlBudget}s budget)...`);
     await execAsync(curlCmd, (curlBudget + 5) * 1000);
 
     if (!existsSync(partialFile) || statSync(partialFile).size < 1000) {
@@ -331,13 +330,13 @@ export async function extractBuiltinSubtitle(
       return null;
     }
 
-    // Try to extract from the local partial file. Pure local I/O.
-    const ffmpegTimeout = 5;
-    const ffmpegCmd =
-      `timeout ${ffmpegTimeout} ffmpeg -y -loglevel error ` +
-      `-i "${partialFile}" ` +
-      `-map 0:${streamIndex} -c:s srt -f srt "${tmpFile}" 2>>"${stderrFile}"`;
-    await execAsync(ffmpegCmd, (ffmpegTimeout + 2) * 1000);
+    // Try to extract from the local partial file. mkvextract is ~5x
+    // faster than ffmpeg for the same job and handles partial files
+    // more robustly (strict EBML parser).
+    const mkvTimeout = 8;
+    const mkvCmd =
+      `timeout ${mkvTimeout} mkvextract tracks "${partialFile}" ${streamIndex}:"${tmpFile}" 2>>"${stderrFile}"`;
+    await execAsync(mkvCmd, (mkvTimeout + 2) * 1000);
 
     if (existsSync(tmpFile)) {
       const content = readFileSync(tmpFile, 'utf-8');
@@ -351,7 +350,7 @@ export async function extractBuiltinSubtitle(
     if (existsSync(stderrFile)) {
       const err = readFileSync(stderrFile, 'utf-8');
       const tail = err.trim().split('\n').slice(-2).join(' | ');
-      console.log(`[aligner] foreground: ffmpeg got no sub content; route will background-extract. stderr: ${tail}`);
+      console.log(`[aligner] foreground: mkvextract got no sub content; route will background-extract. stderr: ${tail}`);
     }
     return null;
   } catch (e: any) {

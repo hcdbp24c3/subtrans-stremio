@@ -17,7 +17,7 @@ FROM node:20-slim
 # PEP 668: Debian Python is externally-managed — install ffsubsync into a venv
 # and put it on PATH so `execSync('ffsubsync ...')` works.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg curl python3 python3-pip python3-venv && \
+    apt-get install -y --no-install-recommends ffmpeg mkvtoolnix curl python3 python3-pip python3-venv && \
     rm -rf /var/lib/apt/lists/* && \
     python3 -m venv /opt/ffsubsync-venv && \
     /opt/ffsubsync-venv/bin/pip install --no-cache-dir --upgrade pip && \
