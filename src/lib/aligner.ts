@@ -255,6 +255,9 @@ export async function extractBuiltinSubtitle(
   timeoutSec = 30,
 ): Promise<string | null> {
   const tmpFile = join(tmpdir(), `builtin_sub_${streamIndex}_${Date.now()}.srt`);
+  // Escape the URL for shell — torrentio URLs contain '&', '?', etc. that
+  // would be interpreted as shell metacharacters without quoting.
+  const safeUrl = videoUrl.replace(/(["'$`\\])/g, '\\$1');
   // -sn: only scan subtitle streams (skip video/audio analysis = much faster
   //       for large files where ffprobe would otherwise scan GBs of packets)
   // -probesize 64M: analyze up to 64MB instead of 32 — needed for some
@@ -262,11 +265,18 @@ export async function extractBuiltinSubtitle(
   //                  show up in 32M
   // -analyzeduration 0: don't waste time on A/V analysis
   // -c:s srt: re-mux to plain SRT
-  const cmd = `timeout ${timeoutSec} ffmpeg -y -probesize 64M -analyzeduration 0 -sn -i "${videoUrl}" ` +
+  // -user_agent: torrentio/torbox reject empty User-Agent; pass a browser
+  //              UA so the server returns real bytes instead of an error
+  // -reconnect 1: reconnect on transient errors (Torbox CDN flaky)
+  const cmd =
+    `timeout ${timeoutSec} ffmpeg -y ` +
+    `-probesize 64M -analyzeduration 0 -sn ` +
+    `-user_agent "Mozilla/5.0" -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 ` +
+    `-i "${safeUrl}" ` +
     `-map 0:${streamIndex} -c:s srt -f srt "${tmpFile}" 2>/dev/null`;
   try {
     console.log(`[aligner] Extracting builtin sub stream ${streamIndex} (timeout ${timeoutSec}s)...`);
-    await execAsync(cmd, (timeoutSec + 10) * 1000);
+    await execAsync(cmd, (timeoutSec + 15) * 1000);
     if (existsSync(tmpFile)) {
       const content = readFileSync(tmpFile, 'utf-8');
       try { unlinkSync(tmpFile); } catch {}
@@ -289,7 +299,7 @@ export async function extractBuiltinSubtitle(
       } catch {}
     }
     try { unlinkSync(tmpFile); } catch {}
-    console.log(`[aligner] Builtin sub extraction failed: ${e.message?.substring(0, 100)}`);
+    console.log(`[aligner] Builtin sub extraction failed: ${e.message?.substring(0, 200)}`);
     return null;
   }
 }

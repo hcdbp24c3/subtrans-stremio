@@ -330,7 +330,7 @@ router.get('/subtitles/:type/*', async (req, res) => {
       // first response for a populated cache, which is the right call when
       // extraction is 10-30s and the user's client aborts at 20s.
       console.log(`[translate] builtin sub cache miss: scheduling background extract for track ${best.index}`);
-      void extractBuiltinSubtitle(vidUrl, best.index, 60)
+      void extractBuiltinSubtitle(vidUrl, best.index, 30)
         .then(async (srt) => {
           if (!srt) {
             console.log(`[translate] background extract: no content for track ${best.index}`);
