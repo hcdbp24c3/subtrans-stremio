@@ -954,7 +954,23 @@
       return params.toString();
     }
 
+    function configToPathSegment(configStr) {
+      // UTF-8 -> base64 -> base64url (URL-safe, no padding)
+      return btoa(unescape(encodeURIComponent(configStr)))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+    }
+
     function buildManifestUrl() {
+      const cfg = buildConfigQuery();
+      // Path-segment form (Stremio protocol convention):
+      //   <base>/<config>/manifest.json
+      // Fall back to legacy ?config= query string for old clients.
+      return window.location.origin + '/' + configToPathSegment(cfg) + '/manifest.json';
+    }
+
+    function buildLegacyManifestUrl() {
       return window.location.origin + '/manifest.json?config=' + encodeURIComponent(buildConfigQuery());
     }
 

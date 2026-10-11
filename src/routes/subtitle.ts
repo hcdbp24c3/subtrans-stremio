@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { decodeConfig, encodeConfig, AddonConfig } from '../config.js';
 import { fetchJson, fetchText } from '../lib/proxy.js';
 import {
@@ -189,11 +189,40 @@ export function dedupeSubtitles(subs: Subtitle[]): Subtitle[] {
 // Stremio appends extra path segments to subtitle URLs:
 //   /subtitles/movie/tt27681354/filename=...mkv&videoSize=...json
 // Use wildcard to capture the full path after /subtitles/:type/
-router.get('/subtitles/:type/*', async (req, res) => {
+//
+// We accept the config in three forms for max compatibility:
+//   1. /subtitles/<type>/<id>.json?config=...   (legacy query string)
+//   2. /<config>/subtitles/<type>/<id>.json     (path segment, base64url)
+// The path-segment form matches Stremio's protocol convention for
+// "extra args" (see protocol.md "/{resource}/{type}/{id}/{extraArgs}.json
+// where extraArgs is the query string stringified object").
+
+const PATH_SEGMENT_RE = '[A-Za-z0-9_-]+'; // base64url charset
+
+function decodePathConfig(seg: string | undefined): string | undefined {
+  if (!seg) return undefined;
+  try {
+    const b64 = seg.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+    return Buffer.from(padded, 'base64').toString('utf-8');
+  } catch {
+    return undefined;
+  }
+}
+
+async function subtitlesHandler(req: Request, res: Response) {
   const startedAt = Date.now();
   const budgetLeftMs = () => HANDLER_BUDGET_MS - (Date.now() - startedAt);
 
-  const configStr = req.query.config as string;
+  let configStr: string | undefined;
+  const pathConfig = (req.params as { config?: string }).config;
+  if (pathConfig) {
+    configStr = decodePathConfig(pathConfig);
+  } else {
+    const raw = req.query.config;
+    const first = Array.isArray(raw) ? raw[0] : raw;
+    configStr = typeof first === 'string' ? first : undefined;
+  }
   if (!configStr) {
     res.status(400).json({ error: 'Missing config' });
     return;
@@ -205,12 +234,13 @@ router.get('/subtitles/:type/*', async (req, res) => {
     return;
   }
 
-  const { type } = req.params;
   // Wildcard captures everything after /subtitles/:type/
   // e.g. "tt27681354/filename=...mkv&videoSize=...json"
   const wildcard = (req.params as any)[0] || '';
   const rawId = wildcard.split('/')[0];
   const decodedId = decodeURIComponent(rawId).replace(/\.json$/, '');
+  const { type: paramType } = req.params;
+  const type = Array.isArray(paramType) ? paramType[0] : paramType;
 
   // 1. Check cache
   const key = cacheKey(config, type, decodedId);
@@ -325,32 +355,68 @@ router.get('/subtitles/:type/*', async (req, res) => {
         streamIndex: best.index,
       };
     } else {
-      // Background extract: do NOT block the response. The next /subtitles
-      // request (or a retry) will see the warmed cache. This trades a 0-sub
-      // first response for a populated cache, which is the right call when
-      // extraction is 10-30s and the user's client aborts at 20s.
-      console.log(`[translate] builtin sub cache miss: scheduling background extract for track ${best.index}`);
-      void extractBuiltinSubtitle(vidUrl, best.index, 30)
-        .then(async (srt) => {
-          if (!srt) {
-            console.log(`[translate] background extract: no content for track ${best.index}`);
-            return;
-          }
+      // Decide foreground vs background extract:
+      //   - If the user is asking for translation (translateTargets set), do a
+      //     foreground (blocking) extract so the first request returns
+      //     translated subs instead of an empty list. This costs ~30s on
+      //     first hit, but the next /subtitles request is instant.
+      //   - If no translation needed, extract in the background so the
+      //     response returns immediately. The next request will hit the
+      //     warmed cache.
+      const willTranslate = config.translateTargets.length > 0;
+      // Foreground needs: extract (~30s) + translate API (~5-10s) + translate stitch.
+      // Budget is 14s — too tight for 30s extract. The route's HANDLER_BUDGET_MS
+      // is set for the SECOND+ requests when cache is warm; for the first
+      // (no-cache) request we need a longer budget. Solution: only do foreground
+      // when there's enough room to make it worthwhile, otherwise background.
+      const remaining = budgetLeftMs();
+      const doForeground = willTranslate && remaining > 12_000; // at least 12s left
+
+      if (doForeground) {
+        console.log(`[translate] builtin sub cache miss: foreground extract for track ${best.index} (${remaining}ms left)`);
+        const srt = await extractBuiltinSubtitle(vidUrl, best.index, 12);
+        if (srt) {
           const entries = parseSubtitle(srt, 'srt');
-          if (entries.length === 0) {
-            console.log(`[translate] background extract: empty parse for track ${best.index}`);
-            return;
+          if (entries.length > 0) {
+            setCachedBuiltinSub(vidUrl, best.index, {
+              entries, format: 'srt', lang: best.lang,
+              streamIndex: best.index, extractedAt: Date.now(),
+            });
+            console.log(`[translate] foreground extract: cached ${entries.length} entries from track ${best.index} (${best.lang})`);
+            builtinSource = {
+              entries, lang: best.lang,
+              videoUrl: vidUrl, streamIndex: best.index,
+            };
+          } else {
+            console.log(`[translate] foreground extract: empty parse for track ${best.index}`);
           }
-          setCachedBuiltinSub(vidUrl, best.index, {
-            entries, format: 'srt', lang: best.lang,
-            streamIndex: best.index, extractedAt: Date.now(),
+        } else {
+          console.log(`[translate] foreground extract: no content for track ${best.index}`);
+        }
+      } else {
+        console.log(`[translate] builtin sub cache miss: scheduling background extract for track ${best.index}`);
+        void extractBuiltinSubtitle(vidUrl, best.index, 30)
+          .then(async (srt) => {
+            if (!srt) {
+              console.log(`[translate] background extract: no content for track ${best.index}`);
+              return;
+            }
+            const entries = parseSubtitle(srt, 'srt');
+            if (entries.length === 0) {
+              console.log(`[translate] background extract: empty parse for track ${best.index}`);
+              return;
+            }
+            setCachedBuiltinSub(vidUrl, best.index, {
+              entries, format: 'srt', lang: best.lang,
+              streamIndex: best.index, extractedAt: Date.now(),
+            });
+            console.log(`[translate] background extract: cached ${entries.length} entries from track ${best.index} (${best.lang})`);
+          })
+          .catch((e: unknown) => {
+            const msg = e instanceof Error ? e.message : String(e);
+            console.log(`[translate] background extract error: ${msg.substring(0, 200)}`);
           });
-          console.log(`[translate] background extract: cached ${entries.length} entries from track ${best.index} (${best.lang})`);
-        })
-        .catch((e: unknown) => {
-          const msg = e instanceof Error ? e.message : String(e);
-          console.log(`[translate] background extract error: ${msg.substring(0, 200)}`);
-        });
+      }
     }
   }
 
@@ -571,7 +637,11 @@ router.get('/subtitles/:type/*', async (req, res) => {
   }
 
   res.json(result);
-});
+}
+
+router.get('/subtitles/:type/*', subtitlesHandler);
+// Path-segment config: /<config>/subtitles/<type>/<id>.json
+router.get(`/:config(${PATH_SEGMENT_RE})/subtitles/:type/*`, subtitlesHandler);
 
 /** Re-download each subtitle, apply offset, cache aligned SRT under /alignedsub/. */
 async function applyOffsetToSubtitles(subs: Subtitle[], offset: number): Promise<Subtitle[]> {
