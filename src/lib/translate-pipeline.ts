@@ -188,7 +188,7 @@ export async function runLingarrPipeline(
   }
 
   const targets = (input.config.translateTargets ?? [])
-    .map((c) => c.trim().toLowerCase())
+    .map((c) => normalizeLangForPipeline(c.trim()))
     .filter(Boolean)
     .slice(0, MAX_LANGS_PER_REQUEST);
   if (targets.length === 0) {

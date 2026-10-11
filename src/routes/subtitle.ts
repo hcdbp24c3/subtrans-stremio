@@ -355,26 +355,26 @@ async function subtitlesHandler(req: Request, res: Response) {
         streamIndex: best.index,
       };
     } else {
-      // Decide foreground vs background extract:
-      //   - If the user is asking for translation (translateTargets set), do a
-      //     foreground (blocking) extract so the first request returns
-      //     translated subs instead of an empty list. This costs ~30s on
-      //     first hit, but the next /subtitles request is instant.
-      //   - If no translation needed, extract in the background so the
-      //     response returns immediately. The next request will hit the
-      //     warmed cache.
+      // Foreground extract when user requested translation. Cost: blocks
+      // the response until extract + translate finish (~5-15s on a healthy
+      // CDN, up to 30s on slow torrents). Benefit: the very first request
+      // returns translated subs — user does not need to play, exit, and
+      // re-enter to trigger the background path.
+      //
+      // We cap the extract at 12s so we leave at least a few seconds for
+      // the translate API + stitch. If 12s isn't enough the partial
+      // recovery in extractBuiltinSubtitle returns whatever cues it
+      // managed to read; the translate call still works on partial data.
       const willTranslate = config.translateTargets.length > 0;
-      // Foreground needs: extract (~30s) + translate API (~5-10s) + translate stitch.
-      // Budget is 14s — too tight for 30s extract. The route's HANDLER_BUDGET_MS
-      // is set for the SECOND+ requests when cache is warm; for the first
-      // (no-cache) request we need a longer budget. Solution: only do foreground
-      // when there's enough room to make it worthwhile, otherwise background.
-      const remaining = budgetLeftMs();
-      const doForeground = willTranslate && remaining > 12_000; // at least 12s left
+      const doForeground = willTranslate;
 
       if (doForeground) {
+        const remaining = budgetLeftMs();
         console.log(`[translate] builtin sub cache miss: foreground extract for track ${best.index} (${remaining}ms left)`);
-        const srt = await extractBuiltinSubtitle(vidUrl, best.index, 12);
+        // Use min(12, remaining-2) for the extract so we leave ~2s for
+        // the translate API + response serialization.
+        const extractBudget = Math.max(4, Math.min(12, remaining - 2_000));
+        const srt = await extractBuiltinSubtitle(vidUrl, best.index, extractBudget);
         if (srt) {
           const entries = parseSubtitle(srt, 'srt');
           if (entries.length > 0) {
