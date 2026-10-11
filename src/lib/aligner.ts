@@ -289,40 +289,32 @@ export async function extractBuiltinSubtitle(
   const safeUrl = videoUrl.replace(/(["'$`\\])/g, '\\$1');
 
   try {
-    // Step 1: ffprobe to find the first packet of the sub track. This
-    // tells us the byte offset of the cluster that contains the first
-    // dialogue cue. On 30-80 GB torrents this offset can be 200-400 MB
-    // into the file — naive "download first 32 MB" never reaches it.
-    //
-    // ffprobe scan over a 30 GB file takes ~7s even with packet filtering
-    // (it has to walk the EBML tree). Use a 20s budget so it always has
-    // time to find the track on slower CDNs.
-    const probeBudget = Math.max(8, Math.min(20, timeoutSec - 8));
+    // For built-in sub from a 30-80 GB torrent, the sub cluster may sit
+    // hundreds of MB past the first packet and we can't always locate
+    // it in a reasonable download window. The route falls back to a
+    // background full extract (up to 30s) when this fails; the next
+    // /subtitles request hits the warmed cache. So here we attempt
+    // foreground but don't burn too much time on it.
+    if (input.budgetMs < 4_000) {
+      return null; // route would skip anyway
+    }
+    const probeBudget = 8; // seconds; ffprobe scan over a 30 GB file is ~5-8s
     const firstPos = probeFirstPacketPos(safeUrl, streamIndex, probeBudget * 1000);
     if (firstPos === null) {
-      console.log(`[aligner] probe: no sub packets found for track ${streamIndex}`);
+      console.log(`[aligner] probe: no sub packets found for track ${streamIndex}; route will background-extract`);
       return null;
     }
     console.log(`[aligner] probe: track ${streamIndex} first packet at byte ${firstPos}`);
 
-    // Step 2: download a 256 MB window. On a 30-80 GB torrent the sub
-    // track's first readable cluster can be hundreds of MB after the
-    // first packet (clusters store track data; the first packet
-    // position points at the cluster header, but the data block sits
-    // a few clusters later). 256 MB gives ffmpeg enough headroom for
-    // REMUXes where the dialogue sub cluster is 200-400 MB into the
-    // file. 256 MB on a healthy CDN is ~10-20s (Range request, 206
-    // Partial Content).
-    //
-    // If this still doesn't include the cluster, the extract fails
-    // gracefully (returns null) and the route falls back to a
-    // background extract — user has to play, exit, and re-enter once
-    // for the cache to warm. That's the best we can do without
-    // downloading the full 30 GB file.
-    const WINDOW = 256 * 1024 * 1024; // 256 MB
-    const rangeStart = Math.max(0, firstPos - 64 * 1024); // include cluster header
+    // Best-effort foreground extract: small window (~32 MB) starting at
+    // the cluster header. If the actual sub data is past the window,
+    // ffmpeg reports "Stream map matches no streams" and we return null
+    // so the route schedules a full background extract. Most of the
+    // 30s budget goes to the background path on the second request.
+    const WINDOW = 32 * 1024 * 1024; // 32 MB
+    const rangeStart = Math.max(0, firstPos - 64 * 1024);
     const rangeEnd = rangeStart + WINDOW - 1;
-    const curlBudget = Math.max(15, Math.min(25, timeoutSec - 5));
+    const curlBudget = Math.max(6, Math.min(12, input.budgetMs / 1000 - 2));
     const curlCmd =
       `timeout ${curlBudget} curl -sSL ` +
       `-A "Mozilla/5.0" ` +
@@ -330,24 +322,16 @@ export async function extractBuiltinSubtitle(
       `--max-time ${curlBudget - 1} ` +
       `-o "${partialFile}" ` +
       `"${safeUrl}" 2>"${stderrFile}"`;
-    console.log(`[aligner] Downloading ${WINDOW / 1024 / 1024} MB window at offset ${rangeStart} (${curlBudget}s budget)...`);
+    console.log(`[aligner] foreground: trying ${WINDOW / 1024 / 1024} MB window at offset ${rangeStart} (${curlBudget}s budget)...`);
     await execAsync(curlCmd, (curlBudget + 5) * 1000);
 
-    if (!existsSync(partialFile)) {
-      console.log(`[aligner] curl produced no output file`);
-      return null;
-    }
-    const stat = statSync(partialFile);
-    console.log(`[aligner] Downloaded ${stat.size} bytes from offset ${rangeStart}`);
-    if (stat.size < 1000) {
-      const err = readFileSync(stderrFile, 'utf-8').trim();
-      console.log(`[aligner] Download too small (${stat.size} bytes). stderr: ${err.slice(0, 200)}`);
+    if (!existsSync(partialFile) || statSync(partialFile).size < 1000) {
+      console.log(`[aligner] foreground: download too small, route will background-extract`);
       return null;
     }
 
-    // Step 3: ffmpeg reads from the local partial file — no network, no
-    // probe limit. Should finish in <1 second.
-    const ffmpegTimeout = 6;
+    // Try to extract from the local partial file. Pure local I/O.
+    const ffmpegTimeout = 5;
     const ffmpegCmd =
       `timeout ${ffmpegTimeout} ffmpeg -y -loglevel error ` +
       `-i "${partialFile}" ` +
@@ -358,15 +342,15 @@ export async function extractBuiltinSubtitle(
       const content = readFileSync(tmpFile, 'utf-8');
       try { unlinkSync(tmpFile); } catch {}
       if (content.trim().length > 0) {
-        console.log(`[aligner] Extracted builtin sub: ${content.length} bytes, ${countSrtEntries(content)} entries`);
+        const entryCount = countSrtEntries(content);
+        console.log(`[aligner] foreground extracted: ${content.length} bytes, ${entryCount} entries`);
         return content;
       }
     }
-    // ffmpeg exited cleanly but produced no content
     if (existsSync(stderrFile)) {
       const err = readFileSync(stderrFile, 'utf-8');
-      const tail = err.trim().split('\n').slice(-3).join(' | ');
-      console.log(`[aligner] ffmpeg produced no sub content. stderr: ${tail}`);
+      const tail = err.trim().split('\n').slice(-2).join(' | ');
+      console.log(`[aligner] foreground: ffmpeg got no sub content; route will background-extract. stderr: ${tail}`);
     }
     return null;
   } catch (e: any) {

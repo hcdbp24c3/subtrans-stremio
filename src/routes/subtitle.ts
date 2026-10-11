@@ -355,25 +355,17 @@ async function subtitlesHandler(req: Request, res: Response) {
         streamIndex: best.index,
       };
     } else {
-      // Foreground extract when user requested translation. Cost: blocks
-      // the response until extract + translate finish (~5-15s on a healthy
-      // CDN, up to 30s on slow torrents). Benefit: the very first request
-      // returns translated subs — user does not need to play, exit, and
-      // re-enter to trigger the background path.
-      //
-      // We cap the extract at 12s so we leave at least a few seconds for
-      // the translate API + stitch. If 12s isn't enough the partial
-      // recovery in extractBuiltinSubtitle returns whatever cues it
-      // managed to read; the translate call still works on partial data.
+      // Try a quick foreground extract (32 MB window) so the first request
+      // has a chance of returning subs on a healthy CDN. If the cluster
+      // sits past that window, the route falls back to a background
+      // extract (this same call returns null) and the next /subtitles
+      // request will hit the warmed cache. User has to play, exit, and
+      // re-enter once.
       const willTranslate = config.translateTargets.length > 0;
-      const doForeground = willTranslate;
-
-      if (doForeground) {
-        const remaining = budgetLeftMs();
+      const remaining = budgetLeftMs();
+      if (willTranslate && remaining > 4_000) {
         console.log(`[translate] builtin sub cache miss: foreground extract for track ${best.index} (${remaining}ms left)`);
-        // Use min(12, remaining-2) for the extract so we leave ~2s for
-        // the translate API + response serialization.
-        const extractBudget = Math.max(4, Math.min(12, remaining - 2_000));
+        const extractBudget = Math.max(4, Math.min(12, (remaining - 2_000) / 1000));
         const srt = await extractBuiltinSubtitle(vidUrl, best.index, extractBudget);
         if (srt) {
           const entries = parseSubtitle(srt, 'srt');
@@ -391,7 +383,7 @@ async function subtitlesHandler(req: Request, res: Response) {
             console.log(`[translate] foreground extract: empty parse for track ${best.index}`);
           }
         } else {
-          console.log(`[translate] foreground extract: no content for track ${best.index}`);
+          console.log(`[translate] foreground extract: no content for track ${best.index} — route will background-extract`);
         }
       } else {
         console.log(`[translate] builtin sub cache miss: scheduling background extract for track ${best.index}`);
