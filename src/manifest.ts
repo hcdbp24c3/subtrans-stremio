@@ -13,6 +13,10 @@ export function generateManifest(
     catalogs: [],
     resources: ['stream', 'subtitles'],
     types: ['movie', 'series'],
+    // transportUrl tells Stremio which base URL to call for /subtitles/...
+    // and /stream/... requests. Without it, the client may guess wrong
+    // (e.g. default to a stale cached value).
+    transportUrl: transportUrl.replace(/\/$/, ''),
     behavior: {
       bingeOnly: false,
     },
