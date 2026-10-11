@@ -272,17 +272,17 @@ export async function extractBuiltinSubtitle(
   // would be interpreted as shell metacharacters without quoting.
   const safeUrl = videoUrl.replace(/(["'$`\\])/g, '\\$1');
 
-  // Step 1: download first 32 MB via curl (separate timeout — most of the
+  // Step 1: download first 64 MB via curl (separate timeout — most of the
   // 30s budget goes here; if curl succeeds, ffmpeg is instant on the
   // local partial file).
   //
-  // 32 MB chosen so we cross most MKV "cluster" boundaries: sub tracks in
+  // 64 MB chosen so we cross most MKV "cluster" boundaries: sub tracks in
   // Matroska are typically indexed in the Cues element which is at the end
-  // of the file. 4 MB only got us the EBML header + 1 cue (1 entry); 32 MB
-  // usually gets us the full Cues section. We also use Range request so
-  // torrent CDNs respond with 206 Partial Content (a real 30 GB file
-  // doesn't need to be downloaded whole).
-  const PARTIAL_SIZE = 32 * 1024 * 1024; // 32 MB
+  // of the file. 4 MB only got us 1 cue, 32 MB got us 2 cues; 64 MB
+  // usually gets us 20-50+ cues depending on sub density. We use Range
+  // request so torrent CDNs respond with 206 Partial Content (a real
+  // 30 GB file doesn't need to be downloaded whole).
+  const PARTIAL_SIZE = 64 * 1024 * 1024; // 64 MB
   const curlBudget = Math.max(10, timeoutSec - 6);
   const curlCmd =
     `timeout ${curlBudget} curl -sSL ` +

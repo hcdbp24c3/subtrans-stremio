@@ -50,7 +50,14 @@ export const libretranslateProvider: TranslationProvider = {
     for (let i = 0; i < results.length; i++) {
       const res = results[i];
       if (!res) { lastError = 'network error'; continue; }
-      if (!res.ok) { lastError = `HTTP ${res.status}`; continue; }
+      if (!res.ok) {
+        // Capture the actual error body — LibreTranslate returns useful
+        // messages like {"error":"vi is not supported"} that tell the
+        // user which language is missing or which key is invalid.
+        const errBody = await res.text().catch(() => '');
+        lastError = `HTTP ${res.status}: ${errBody.slice(0, 200)}`;
+        continue;
+      }
       const json = await readJson(res);
       if (!json || typeof json !== 'object') { lastError = 'invalid response'; continue; }
       const text = (json as { translatedText?: unknown }).translatedText;

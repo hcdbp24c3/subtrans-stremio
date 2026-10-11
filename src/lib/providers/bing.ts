@@ -45,8 +45,8 @@ export const bingProvider: TranslationProvider = {
     }, opts);
     if (!res) return { lines: new Map(), ok: false, reason: 'network error' };
     if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      return { lines: new Map(), ok: false, reason: `HTTP ${res.status}: ${txt.slice(0, 200)}` };
+      const errBody = await res.text().catch(() => '');
+      return { lines: new Map(), ok: false, reason: `HTTP ${res.status}: ${errBody.slice(0, 200)}` };
     }
     const json = await readJson(res);
     if (!Array.isArray(json) || json.length === 0) {
