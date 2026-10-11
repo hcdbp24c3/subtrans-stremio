@@ -242,7 +242,7 @@
     </div>
 
     <div class="lang-section">
-      <label for="translateSearch">Translation <span class="optional-tag">optional</span></label>
+      <label for="translateSearch">Translation <span class="optional-tag">required to translate</span></label>
       <div class="lingarr-config">
         <select id="translateProvider" autocomplete="off">
           <option value="" data-key="none" data-base="none" data-model="none">— select provider —</option>
@@ -272,7 +272,7 @@
       </div>
       <div class="lang-select" id="translateSelect">
         <div class="lang-control" id="translateControl" onclick="toggleTranslateDropdown(event)">
-          <span class="lang-placeholder" id="translatePlaceholder">Pick languages to auto-translate (leave empty to skip)</span>
+          <span class="lang-placeholder" id="translatePlaceholder">Pick target languages to translate INTO (e.g. vi, ja). Leave empty to skip translation.</span>
         </div>
         <span class="lang-caret">▼</span>
         <div class="lang-dropdown" id="translateDropdown" onclick="event.stopPropagation()">
