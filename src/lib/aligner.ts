@@ -305,14 +305,24 @@ export async function extractBuiltinSubtitle(
     }
     console.log(`[aligner] probe: track ${streamIndex} first packet at byte ${firstPos}`);
 
-    // Step 2: download a small window (10 MB) around the cluster. This
-    // covers the cluster header + the first few MB of sub data. Most
-    // clusters are 2-5 MB so 10 MB is enough to include the entire first
-    // cluster's sub content.
-    const WINDOW = 10 * 1024 * 1024; // 10 MB
+    // Step 2: download a 256 MB window. On a 30-80 GB torrent the sub
+    // track's first readable cluster can be hundreds of MB after the
+    // first packet (clusters store track data; the first packet
+    // position points at the cluster header, but the data block sits
+    // a few clusters later). 256 MB gives ffmpeg enough headroom for
+    // REMUXes where the dialogue sub cluster is 200-400 MB into the
+    // file. 256 MB on a healthy CDN is ~10-20s (Range request, 206
+    // Partial Content).
+    //
+    // If this still doesn't include the cluster, the extract fails
+    // gracefully (returns null) and the route falls back to a
+    // background extract — user has to play, exit, and re-enter once
+    // for the cache to warm. That's the best we can do without
+    // downloading the full 30 GB file.
+    const WINDOW = 256 * 1024 * 1024; // 256 MB
     const rangeStart = Math.max(0, firstPos - 64 * 1024); // include cluster header
     const rangeEnd = rangeStart + WINDOW - 1;
-    const curlBudget = Math.max(8, timeoutSec - 8);
+    const curlBudget = Math.max(15, Math.min(25, timeoutSec - 5));
     const curlCmd =
       `timeout ${curlBudget} curl -sSL ` +
       `-A "Mozilla/5.0" ` +
