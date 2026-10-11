@@ -249,6 +249,31 @@ export function findBestRefSubtitleStream(videoUrl: string): SubtitleStreamInfo 
  * Extract a subtitle track from a video URL as SRT content.
  * Uses timeout — for large files, partial extraction is OK for alignment.
  */
+/**
+ * Locate the first packet of a specific sub track via ffprobe. Returns
+ * the byte offset in the file, or null if not found.
+ */
+function probeFirstPacketPos(videoUrl: string, streamIndex: number, timeoutMs: number): number | null {
+  try {
+    const out = execSync(
+      `ffprobe -v error -select_streams s -show_entries packet=stream_index,pos -of csv=p=0 "${videoUrl}" 2>/dev/null`,
+      { encoding: 'utf-8', timeout: timeoutMs },
+    ).trim();
+    for (const line of out.split('\n')) {
+      const parts = line.split(',');
+      if (parts.length < 2) continue;
+      const idx = parseInt(parts[0], 10);
+      const pos = parseInt(parts[1], 10);
+      if (idx === streamIndex && !isNaN(pos) && pos > 0) {
+        return pos;
+      }
+    }
+  } catch {
+    // fall through
+  }
+  return null;
+}
+
 export async function extractBuiltinSubtitle(
   videoUrl: string,
   streamIndex: number,
@@ -256,45 +281,40 @@ export async function extractBuiltinSubtitle(
 ): Promise<string | null> {
   const tmpFile = join(tmpdir(), `builtin_sub_${streamIndex}_${Date.now()}.srt`);
   const stderrFile = join(tmpdir(), `builtin_sub_${streamIndex}_${Date.now()}.err`);
-  // Two-step extract that's robust on slow torrent CDNs:
-  //   1. Use curl (not ffmpeg) to fetch the first 4 MB of the video with a
-  //      proper Range header. curl handles redirects + Range natively and is
-  //      faster on throttled CDNs than ffmpeg's internal HTTP client.
-  //   2. Feed the partial file to ffmpeg locally (no network) with a small
-  //      timeout — pure local I/O, no more network risk.
-  //
-  // ffmpeg-on-streaming-URL was timing out at 30s because the probe
-  // (probesize) needed to download enough bytes to locate the sub track,
-  // and torrent CDNs throttle non-browser clients.
-
   const partialFile = join(tmpdir(), `builtin_video_${streamIndex}_${Date.now()}.mkv`);
   // Escape the URL for shell — torrentio URLs contain '&', '?', etc. that
   // would be interpreted as shell metacharacters without quoting.
   const safeUrl = videoUrl.replace(/(["'$`\\])/g, '\\$1');
 
-  // Step 1: download first 32 MB via curl (separate timeout — most of the
-  // 30s budget goes here; if curl succeeds, ffmpeg is instant on the
-  // local partial file).
-  //
-  // 32 MB is enough to cross most MKV "cluster" boundaries and pick up
-  // the Cues section. Sub tracks in Matroska are typically indexed in
-  // the Cues element; for files with sparse cues (most movies have
-  // ~1 cue per subtitle line, so 2-3 cues/min × 10 min = 20-30 cues fit
-  // comfortably in 32 MB). We use Range request so torrent CDNs respond
-  // with 206 Partial Content (a real 30 GB file doesn't need to be
-  // downloaded whole).
-  const PARTIAL_SIZE = 32 * 1024 * 1024; // 32 MB
-  const curlBudget = Math.max(10, timeoutSec - 6);
-  const curlCmd =
-    `timeout ${curlBudget} curl -sSL ` +
-    `-A "Mozilla/5.0" ` +
-    `-H "Range: bytes=0-${PARTIAL_SIZE - 1}" ` +
-    `--max-time ${curlBudget - 1} ` +
-    `-o "${partialFile}" ` +
-    `"${safeUrl}" 2>"${stderrFile}"`;
-
   try {
-    console.log(`[aligner] Downloading first ${PARTIAL_SIZE / 1024 / 1024} MB of video via curl (${curlBudget}s budget)...`);
+    // Step 1: ffprobe to find the first packet of the sub track. This
+    // tells us the byte offset of the cluster that contains the first
+    // dialogue cue. On 30-80 GB torrents this offset can be 200-400 MB
+    // into the file — naive "download first 32 MB" never reaches it.
+    const probeBudget = Math.max(5, Math.min(10, timeoutSec - 20));
+    const firstPos = probeFirstPacketPos(safeUrl, streamIndex, probeBudget * 1000);
+    if (firstPos === null) {
+      console.log(`[aligner] probe: no sub packets found for track ${streamIndex}`);
+      return null;
+    }
+    console.log(`[aligner] probe: track ${streamIndex} first packet at byte ${firstPos}`);
+
+    // Step 2: download a small window (10 MB) around the cluster. This
+    // covers the cluster header + the first few MB of sub data. Most
+    // clusters are 2-5 MB so 10 MB is enough to include the entire first
+    // cluster's sub content.
+    const WINDOW = 10 * 1024 * 1024; // 10 MB
+    const rangeStart = Math.max(0, firstPos - 64 * 1024); // include cluster header
+    const rangeEnd = rangeStart + WINDOW - 1;
+    const curlBudget = Math.max(8, timeoutSec - 8);
+    const curlCmd =
+      `timeout ${curlBudget} curl -sSL ` +
+      `-A "Mozilla/5.0" ` +
+      `-H "Range: bytes=${rangeStart}-${rangeEnd}" ` +
+      `--max-time ${curlBudget - 1} ` +
+      `-o "${partialFile}" ` +
+      `"${safeUrl}" 2>"${stderrFile}"`;
+    console.log(`[aligner] Downloading ${WINDOW / 1024 / 1024} MB window at offset ${rangeStart} (${curlBudget}s budget)...`);
     await execAsync(curlCmd, (curlBudget + 5) * 1000);
 
     if (!existsSync(partialFile)) {
@@ -302,16 +322,15 @@ export async function extractBuiltinSubtitle(
       return null;
     }
     const stat = statSync(partialFile);
-    console.log(`[aligner] Downloaded ${stat.size} bytes; extracting track ${streamIndex} via local ffmpeg`);
+    console.log(`[aligner] Downloaded ${stat.size} bytes from offset ${rangeStart}`);
     if (stat.size < 1000) {
       const err = readFileSync(stderrFile, 'utf-8').trim();
-      console.log(`[aligner] Download too small (${stat.size} bytes); server rejected. stderr: ${err.slice(0, 200)}`);
-      unlinkSync(partialFile);
+      console.log(`[aligner] Download too small (${stat.size} bytes). stderr: ${err.slice(0, 200)}`);
       return null;
     }
 
-    // Step 2: ffmpeg reads from the local partial file — no network,
-    // no probe limit, no redirect, no UA. Should finish in <1 second.
+    // Step 3: ffmpeg reads from the local partial file — no network, no
+    // probe limit. Should finish in <1 second.
     const ffmpegTimeout = 6;
     const ffmpegCmd =
       `timeout ${ffmpegTimeout} ffmpeg -y -loglevel error ` +
@@ -322,8 +341,6 @@ export async function extractBuiltinSubtitle(
     if (existsSync(tmpFile)) {
       const content = readFileSync(tmpFile, 'utf-8');
       try { unlinkSync(tmpFile); } catch {}
-      try { unlinkSync(partialFile); } catch {}
-      try { unlinkSync(stderrFile); } catch {}
       if (content.trim().length > 0) {
         console.log(`[aligner] Extracted builtin sub: ${content.length} bytes, ${countSrtEntries(content)} entries`);
         return content;
@@ -337,7 +354,6 @@ export async function extractBuiltinSubtitle(
     }
     return null;
   } catch (e: any) {
-    // Step 1 (curl) or step 2 (ffmpeg) failed
     if (existsSync(tmpFile)) {
       try {
         const content = readFileSync(tmpFile, 'utf-8');
@@ -358,7 +374,6 @@ export async function extractBuiltinSubtitle(
     console.log(`[aligner] Builtin sub extraction failed: ${e.message?.substring(0, 100)} | stderr: ${errTail || '(empty)'}`);
     return null;
   } finally {
-    // Always clean up the partial video file — it's potentially 4 MB
     for (const f of [tmpFile, partialFile, stderrFile]) {
       try { unlinkSync(f); } catch {}
     }
