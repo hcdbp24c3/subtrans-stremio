@@ -260,20 +260,26 @@ export async function extractBuiltinSubtitle(
   const safeUrl = videoUrl.replace(/(["'$`\\])/g, '\\$1');
   // -sn: only scan subtitle streams (skip video/audio analysis = much faster
   //       for large files where ffprobe would otherwise scan GBs of packets)
-  // -probesize 64M: analyze up to 64MB instead of 32 — needed for some
-  //                  MKV files with header-stored sub timing that won't
-  //                  show up in 32M
+  // -probesize 4M: only analyze the first 4MB. Most MKV text subs have their
+  //                  timing data in the first cluster; 4M is enough for 99%
+  //                  of files and avoids 60s+ waits on 30GB torrents.
+  //                  (Previously 64M — way too slow on torrent streams.)
   // -analyzeduration 0: don't waste time on A/V analysis
+  // -t 600: only read first 10 minutes. Sub tracks almost always have
+  //          content in the first few minutes; if ffmpeg timeouts the
+  //          partial file recovery still gets useful cues.
   // -c:s srt: re-mux to plain SRT
   // -user_agent: torrentio/torbox reject empty User-Agent; pass a browser
   //              UA so the server returns real bytes instead of an error
   // -reconnect 1: reconnect on transient errors (Torbox CDN flaky)
+  // -loglevel error: keep stderr minimal so our catch sees only the real
+  //                  error message
   const cmd =
-    `timeout ${timeoutSec} ffmpeg -y ` +
-    `-probesize 64M -analyzeduration 0 -sn ` +
+    `timeout ${timeoutSec} ffmpeg -y -loglevel error ` +
+    `-probesize 4M -analyzeduration 0 -sn ` +
     `-user_agent "Mozilla/5.0" -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 ` +
-    `-i "${safeUrl}" ` +
-    `-map 0:${streamIndex} -c:s srt -f srt "${tmpFile}" 2>/dev/null`;
+    `-i "${safeUrl}" -t 600 ` +
+    `-map 0:${streamIndex} -c:s srt -f srt "${tmpFile}" 2>&1`;
   try {
     console.log(`[aligner] Extracting builtin sub stream ${streamIndex} (timeout ${timeoutSec}s)...`);
     await execAsync(cmd, (timeoutSec + 15) * 1000);
