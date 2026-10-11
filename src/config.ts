@@ -31,15 +31,6 @@ export interface AddonConfig {
    * Empty = do not auto-translate.
    */
   translateTargets: string[];
-  /**
-   * @deprecated Kept for backward-compat with manifests that still reference
-   * a hosted Lingarr instance. If `translateProvider` is empty AND
-   * `lingarrUrl` is set, the route will warn and skip translation
-   * (Lingarr is no longer supported in this addon).
-   */
-  lingarrUrl: string;
-  /** @deprecated Companion to lingarrUrl. */
-  lingarrApiKey: string;
 }
 
 export function encodeConfig(config: AddonConfig): string {
@@ -58,8 +49,6 @@ export function encodeConfig(config: AddonConfig): string {
   for (const code of config.translateTargets) {
     if (code) params.append('translate', code);
   }
-  if (config.lingarrUrl) params.set('lingarr', config.lingarrUrl);
-  if (config.lingarrApiKey) params.set('lingarrKey', config.lingarrApiKey);
   return params.toString();
 }
 
@@ -78,8 +67,6 @@ export function decodeConfig(queryString: string): AddonConfig | null {
       translateBaseUrl: (params.get('tbu') || '').trim(),
       translateModel: (params.get('tm') || '').trim(),
       translateTargets: params.getAll('translate').map((c) => c.trim()).filter(Boolean),
-      lingarrUrl: (params.get('lingarr') || '').trim(),
-      lingarrApiKey: (params.get('lingarrKey') || '').trim(),
     };
   } catch {
     return null;

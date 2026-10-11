@@ -19,7 +19,7 @@
  *   - honors opts.signal / opts.timeoutMs for caller-side cancellation
  */
 
-import { SubtitleEntry } from './subtitle-parser.js';
+import { SubtitleEntry } from '../subtitle-parser.js';
 
 export interface ProviderRequest {
   /** Source language, ISO 639-1 (e.g. "en"). */

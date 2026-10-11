@@ -13,7 +13,7 @@ import {
 import { detectFileExt } from './subtitle-ext.js';
 import { createTtlStore } from '../lib/ttl-store.js';
 import { resolveRealUrl } from '../lib/proxy-resolve.js';
-import { runLingarrPipeline, LingarrSourceSub } from '../lib/lingarr-pipeline.js';
+import { runLingarrPipeline, LingarrSourceSub } from '../lib/translate-pipeline.js';
 import {
   getCachedBuiltinSub, setCachedBuiltinSub,
 } from '../lib/builtin-sub-cache.js';
@@ -317,7 +317,7 @@ router.get('/subtitles/:type/*', async (req, res) => {
 
     const cached = getCachedBuiltinSub(vidUrl, best.index);
     if (cached) {
-      console.log(`[lingarr] builtin sub cache hit: track ${best.index} (${cached.lang}, ${cached.entries.length} entries)`);
+      console.log(`[translate] builtin sub cache hit: track ${best.index} (${cached.lang}, ${cached.entries.length} entries)`);
       builtinSource = {
         entries: cached.entries,
         lang: cached.lang,
@@ -329,27 +329,27 @@ router.get('/subtitles/:type/*', async (req, res) => {
       // request (or a retry) will see the warmed cache. This trades a 0-sub
       // first response for a populated cache, which is the right call when
       // extraction is 10-30s and the user's client aborts at 20s.
-      console.log(`[lingarr] builtin sub cache miss: scheduling background extract for track ${best.index}`);
+      console.log(`[translate] builtin sub cache miss: scheduling background extract for track ${best.index}`);
       void extractBuiltinSubtitle(vidUrl, best.index, 60)
         .then(async (srt) => {
           if (!srt) {
-            console.log(`[lingarr] background extract: no content for track ${best.index}`);
+            console.log(`[translate] background extract: no content for track ${best.index}`);
             return;
           }
           const entries = parseSubtitle(srt, 'srt');
           if (entries.length === 0) {
-            console.log(`[lingarr] background extract: empty parse for track ${best.index}`);
+            console.log(`[translate] background extract: empty parse for track ${best.index}`);
             return;
           }
           setCachedBuiltinSub(vidUrl, best.index, {
             entries, format: 'srt', lang: best.lang,
             streamIndex: best.index, extractedAt: Date.now(),
           });
-          console.log(`[lingarr] background extract: cached ${entries.length} entries from track ${best.index} (${best.lang})`);
+          console.log(`[translate] background extract: cached ${entries.length} entries from track ${best.index} (${best.lang})`);
         })
         .catch((e: unknown) => {
           const msg = e instanceof Error ? e.message : String(e);
-          console.log(`[lingarr] background extract error: ${msg.substring(0, 200)}`);
+          console.log(`[translate] background extract error: ${msg.substring(0, 200)}`);
         });
     }
   }
@@ -381,27 +381,27 @@ router.get('/subtitles/:type/*', async (req, res) => {
   //      Built-in source (from background-extracted cache) takes priority over
   //      upstream subs when both are available.
   if (config.translateTargets.length === 0) {
-    console.log(`[lingarr] skip: no translateTargets configured`);
+    console.log(`[translate] skip: no translateTargets configured`);
   } else if (budgetLeftMs() < 4_000) {
-    console.log(`[lingarr] skip: budget low (${budgetLeftMs()}ms < 4000ms)`);
+    console.log(`[translate] skip: budget low (${budgetLeftMs()}ms < 4000ms)`);
   } else {
-    const lingarrInput: LingarrSourceSub[] = allSubs.map((s) => ({
+    const translateInput: LingarrSourceSub[] = allSubs.map((s) => ({
       id: s.id,
       url: s.url,
       lang: s.lang,
       format: s._format,
       normLang: s.lang ? normalizeLang(s.lang) : '',
     }));
-    console.log(`[lingarr] running: targets=[${config.translateTargets.join(',')}] builtinSource=${builtinSource ? 'yes' : 'no'} budgetMs=${budgetLeftMs()}`);
-    const lingarrOut = await runLingarrPipeline({
-      subs: lingarrInput,
+    console.log(`[translate] running: targets=[${config.translateTargets.join(',')}] builtinSource=${builtinSource ? 'yes' : 'no'} budgetMs=${budgetLeftMs()}`);
+    const translateOut = await runLingarrPipeline({
+      subs: translateInput,
       config,
       budgetMs: budgetLeftMs(),
       builtinSource: builtinSource ?? undefined,
     });
-    if (lingarrOut.translated) {
-      const newSubs: Subtitle[] = lingarrOut.subs
-        .filter((s) => !lingarrInput.some((orig) => orig.id === s.id && orig.url === s.url))
+    if (translateOut.translated) {
+      const newSubs: Subtitle[] = translateOut.subs
+        .filter((s) => !translateInput.some((orig) => orig.id === s.id && orig.url === s.url))
         .map((s) => ({
           id: s.id,
           url: s.url,
@@ -413,20 +413,20 @@ router.get('/subtitles/:type/*', async (req, res) => {
       // Re-apply per-language cap so translation doesn't push out upstream subs
       allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
       const translatedCount = newSubs.length;
-      const cacheHitCount = lingarrOut.log.filter((l) => l.status === 'cache-hit').length;
-      const freshCount = lingarrOut.log.filter((l) => l.status === 'translated').length;
-      console.log(`[lingarr] inserted ${translatedCount} translated sub(s): ${cacheHitCount} cache, ${freshCount} fresh`);
-      for (const entry of lingarrOut.log) {
-        console.log(`[lingarr] ${entry.target} ← ${entry.source || '?'} ${entry.status}${entry.detail ? ` (${entry.detail})` : ''}`);
+      const cacheHitCount = translateOut.log.filter((l) => l.status === 'cache-hit').length;
+      const freshCount = translateOut.log.filter((l) => l.status === 'translated').length;
+      console.log(`[translate] inserted ${translatedCount} translated sub(s): ${cacheHitCount} cache, ${freshCount} fresh`);
+      for (const entry of translateOut.log) {
+        console.log(`[translate] ${entry.target} ← ${entry.source || '?'} ${entry.status}${entry.detail ? ` (${entry.detail})` : ''}`);
       }
-    } else if (lingarrOut.log.length > 0) {
+    } else if (translateOut.log.length > 0) {
       // Pipeline ran but produced nothing — surface why
-      console.log(`[lingarr] no translation: ${lingarrOut.log.length} log entries`);
-      for (const entry of lingarrOut.log) {
-        console.log(`[lingarr] ${entry.target} ← ${entry.source || '?'} ${entry.status}${entry.detail ? ` (${entry.detail})` : ''}`);
+      console.log(`[translate] no translation: ${translateOut.log.length} log entries`);
+      for (const entry of translateOut.log) {
+        console.log(`[translate] ${entry.target} ← ${entry.source || '?'} ${entry.status}${entry.detail ? ` (${entry.detail})` : ''}`);
       }
     } else {
-      console.log(`[lingarr] no translation (pipeline returned empty log)`);
+      console.log(`[translate] no translation (pipeline returned empty log)`);
     }
   }
 

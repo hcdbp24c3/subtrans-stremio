@@ -24,6 +24,9 @@ export function getProvider(name: string): TranslationProvider | null {
   return PROVIDERS[name] ?? null;
 }
 
+export type { TranslationProvider, ProviderRequest, TranslateResult } from './types.js';
+export { stitchEntries } from './types.js';
+
 /** Default provider list for the configure UI dropdown. */
 export const PROVIDER_OPTIONS: Array<{ value: string; label: string; needsKey: boolean }> = [
   { value: 'google', label: 'Google Translate (500K free/month)', needsKey: true },

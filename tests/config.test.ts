@@ -1,23 +1,26 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import {
   encodeConfig, decodeConfig, AddonConfig,
-  resolveLingarrUrl, resolveLingarrApiKey,
+  resolveTranslateProvider, resolveTranslateKey,
+  resolveTranslateBaseUrl, resolveTranslateModel,
 } from '../src/config.js';
 
-describe('config', () => {
-  const sampleConfig: AddonConfig = {
-    streamUrls: ['https://example.com/stream/manifest.json'],
-    subUrls: ['https://example.com/sub/manifest.json'],
-    languages: '',
-    lingarrUrl: '',
-    lingarrApiKey: '',
-    translateTargets: [],
-  };
+const baseConfig: AddonConfig = {
+  streamUrls: ['https://example.com/stream/manifest.json'],
+  subUrls: ['https://example.com/sub/manifest.json'],
+  languages: '',
+  translateProvider: '',
+  translateKey: '',
+  translateBaseUrl: '',
+  translateModel: '',
+  translateTargets: [],
+};
 
+describe('config', () => {
   it('encodes and decodes single addon roundtrip', () => {
-    const encoded = encodeConfig(sampleConfig);
+    const encoded = encodeConfig(baseConfig);
     const decoded = decodeConfig(encoded);
-    expect(decoded).toEqual(sampleConfig);
+    expect(decoded).toEqual(baseConfig);
   });
 
   it('encodes and decodes multiple addons', () => {
@@ -32,8 +35,10 @@ describe('config', () => {
         'https://sub3.com/manifest.json',
       ],
       languages: 'en,vi',
-      lingarrUrl: '',
-      lingarrApiKey: '',
+      translateProvider: '',
+      translateKey: '',
+      translateBaseUrl: '',
+      translateModel: '',
       translateTargets: [],
     };
     const encoded = encodeConfig(config);
@@ -41,48 +46,44 @@ describe('config', () => {
     expect(decoded).toEqual(config);
   });
 
-  it('encodes and decodes with languages', () => {
+  it('encodes and decodes translate config (provider + key + baseUrl + model + targets)', () => {
     const config: AddonConfig = {
-      ...sampleConfig,
-      languages: 'en,vi,ja',
+      ...baseConfig,
+      translateProvider: 'openai',
+      translateKey: 'sk-test',
+      translateBaseUrl: 'https://api.openai.com',
+      translateModel: 'gpt-4o-mini',
+      translateTargets: ['vi', 'ja'],
     };
     const encoded = encodeConfig(config);
     const decoded = decodeConfig(encoded);
     expect(decoded).toEqual(config);
   });
 
-  it('defaults languages to empty string', () => {
-    const encoded = encodeConfig(sampleConfig);
-    const decoded = decodeConfig(encoded);
-    expect(decoded?.languages).toBe('');
+  it('uses short param names to keep URL compact', () => {
+    const encoded = encodeConfig({
+      ...baseConfig,
+      translateProvider: 'openai',
+      translateKey: 'k',
+      translateTargets: ['vi'],
+    });
+    expect(encoded).toContain('tp=openai');
+    expect(encoded).toContain('tk=k');
+    expect(encoded).toContain('translate=vi');
   });
 
-  it('encodes and decodes lingarr config (url + key + targets)', () => {
-    const config: AddonConfig = {
-      ...sampleConfig,
-      lingarrUrl: 'http://lingarr.local:9876',
-      lingarrApiKey: 'sk-test-1234',
-      translateTargets: ['vi', 'ja', 'ko'],
-    };
-    const encoded = encodeConfig(config);
-    const decoded = decodeConfig(encoded);
-    expect(decoded).toEqual(config);
-  });
-
-  it('omits lingarr fields when empty (URL size economy)', () => {
-    const encoded = encodeConfig(sampleConfig);
-    expect(encoded).not.toContain('lingarr=');
-    expect(encoded).not.toContain('lingarrKey=');
+  it('omits translate fields when empty (URL size economy)', () => {
+    const encoded = encodeConfig(baseConfig);
+    expect(encoded).not.toContain('tp=');
+    expect(encoded).not.toContain('tk=');
+    expect(encoded).not.toContain('tbu=');
+    expect(encoded).not.toContain('tm=');
     expect(encoded).not.toContain('translate=');
-    const decoded = decodeConfig(encoded);
-    expect(decoded?.lingarrUrl).toBe('');
-    expect(decoded?.lingarrApiKey).toBe('');
-    expect(decoded?.translateTargets).toEqual([]);
   });
 
   it('preserves translateTargets order', () => {
     const config: AddonConfig = {
-      ...sampleConfig,
+      ...baseConfig,
       translateTargets: ['ja', 'vi', 'ko', 'zh'],
     };
     const encoded = encodeConfig(config);
@@ -92,7 +93,7 @@ describe('config', () => {
 
   it('filters empty translate target entries on decode', () => {
     const encoded = encodeConfig({
-      ...sampleConfig,
+      ...baseConfig,
       translateTargets: ['vi', '', '  ', 'ja'],
     });
     const decoded = decodeConfig(encoded);
@@ -104,38 +105,20 @@ describe('config', () => {
   });
 
   it('returns null for empty streamUrls', () => {
-    const encoded = encodeConfig({
-      streamUrls: [],
-      subUrls: ['https://example.com/sub/manifest.json'],
-      languages: '',
-      lingarrUrl: '',
-      lingarrApiKey: '',
-      translateTargets: [],
-    });
+    const encoded = encodeConfig({ ...baseConfig, streamUrls: [] });
     expect(decodeConfig(encoded)).toBeNull();
   });
 
   it('returns null for empty subUrls', () => {
-    const encoded = encodeConfig({
-      streamUrls: ['https://example.com/stream/manifest.json'],
-      subUrls: [],
-      languages: '',
-      lingarrUrl: '',
-      lingarrApiKey: '',
-      translateTargets: [],
-    });
+    const encoded = encodeConfig({ ...baseConfig, subUrls: [] });
     expect(decodeConfig(encoded)).toBeNull();
   });
 
   it('preserves URL order', () => {
     const urls = ['https://a.com', 'https://b.com', 'https://c.com'];
     const config: AddonConfig = {
+      ...baseConfig,
       streamUrls: urls,
-      subUrls: ['https://sub.com'],
-      languages: '',
-      lingarrUrl: '',
-      lingarrApiKey: '',
-      translateTargets: [],
     };
     const encoded = encodeConfig(config);
     const decoded = decodeConfig(encoded);
@@ -143,70 +126,86 @@ describe('config', () => {
   });
 });
 
-describe('resolveLingarrUrl', () => {
-  const originalEnv = process.env.LINGARR_URL;
-  afterEach(() => { process.env.LINGARR_URL = originalEnv; });
+describe('resolveTranslateProvider', () => {
+  const originalEnv = process.env.TRANSLATE_PROVIDER;
+  afterEach(() => { process.env.TRANSLATE_PROVIDER = originalEnv; });
 
-  it('prefers config.lingarrUrl over env', () => {
-    process.env.LINGARR_URL = 'http://env-host:9876';
-    expect(resolveLingarrUrl({
-      streamUrls: [], subUrls: [], languages: '',
-      lingarrUrl: 'http://config-host:9876',
-      lingarrApiKey: '', translateTargets: [],
-    })).toBe('http://config-host:9876');
+  it('prefers config over env', () => {
+    process.env.TRANSLATE_PROVIDER = 'deepl';
+    expect(resolveTranslateProvider({ ...baseConfig, translateProvider: 'openai' }))
+      .toBe('openai');
   });
 
   it('falls back to env when config is empty', () => {
-    process.env.LINGARR_URL = 'http://env-host:9876';
-    expect(resolveLingarrUrl({
-      streamUrls: [], subUrls: [], languages: '',
-      lingarrUrl: '', lingarrApiKey: '', translateTargets: [],
-    })).toBe('http://env-host:9876');
+    process.env.TRANSLATE_PROVIDER = 'google';
+    expect(resolveTranslateProvider(baseConfig)).toBe('google');
   });
 
   it('returns null when neither is set', () => {
-    delete process.env.LINGARR_URL;
-    expect(resolveLingarrUrl({
-      streamUrls: [], subUrls: [], languages: '',
-      lingarrUrl: '', lingarrApiKey: '', translateTargets: [],
-    })).toBeNull();
-  });
-
-  it('strips trailing slashes from config URL', () => {
-    process.env.LINGARR_URL = '';
-    expect(resolveLingarrUrl({
-      streamUrls: [], subUrls: [], languages: '',
-      lingarrUrl: 'http://h:9876///',
-      lingarrApiKey: '', translateTargets: [],
-    })).toBe('http://h:9876');
+    delete process.env.TRANSLATE_PROVIDER;
+    expect(resolveTranslateProvider(baseConfig)).toBeNull();
   });
 });
 
-describe('resolveLingarrApiKey', () => {
-  const originalEnv = process.env.LINGARR_API_KEY;
-  afterEach(() => { process.env.LINGARR_API_KEY = originalEnv; });
-
-  it('prefers config key over env', () => {
-    process.env.LINGARR_API_KEY = 'env-key';
-    expect(resolveLingarrApiKey({
-      streamUrls: [], subUrls: [], languages: '',
-      lingarrUrl: '', lingarrApiKey: 'config-key', translateTargets: [],
-    })).toBe('config-key');
+describe('resolveTranslateKey', () => {
+  const originalGeneric = process.env.TRANSLATE_KEY;
+  const originalGoogle = process.env.TRANSLATE_GOOGLE_KEY;
+  afterEach(() => {
+    process.env.TRANSLATE_KEY = originalGeneric;
+    process.env.TRANSLATE_GOOGLE_KEY = originalGoogle;
   });
 
-  it('falls back to env when config is empty', () => {
-    process.env.LINGARR_API_KEY = 'env-key';
-    expect(resolveLingarrApiKey({
-      streamUrls: [], subUrls: [], languages: '',
-      lingarrUrl: '', lingarrApiKey: '', translateTargets: [],
-    })).toBe('env-key');
+  it('prefers config key', () => {
+    process.env.TRANSLATE_KEY = 'env-key';
+    expect(resolveTranslateKey({ ...baseConfig, translateKey: 'config-key' }, 'google'))
+      .toBe('config-key');
   });
 
-  it('returns undefined when neither is set', () => {
-    delete process.env.LINGARR_API_KEY;
-    expect(resolveLingarrApiKey({
-      streamUrls: [], subUrls: [], languages: '',
-      lingarrUrl: '', lingarrApiKey: '', translateTargets: [],
-    })).toBeUndefined();
+  it('falls back to generic TRANSLATE_KEY env', () => {
+    process.env.TRANSLATE_KEY = 'env-key';
+    delete process.env.TRANSLATE_GOOGLE_KEY;
+    expect(resolveTranslateKey(baseConfig, 'google')).toBe('env-key');
+  });
+
+  it('falls back to provider-specific env', () => {
+    delete process.env.TRANSLATE_KEY;
+    process.env.TRANSLATE_GOOGLE_KEY = 'google-key';
+    expect(resolveTranslateKey(baseConfig, 'google')).toBe('google-key');
+  });
+
+  it('returns undefined when no key configured', () => {
+    delete process.env.TRANSLATE_KEY;
+    delete process.env.TRANSLATE_GOOGLE_KEY;
+    expect(resolveTranslateKey(baseConfig, 'google')).toBeUndefined();
+  });
+});
+
+describe('resolveTranslateBaseUrl / resolveTranslateModel', () => {
+  it('falls back to env', () => {
+    const originalBase = process.env.TRANSLATE_BASE_URL;
+    const originalModel = process.env.TRANSLATE_MODEL;
+    process.env.TRANSLATE_BASE_URL = 'http://ollama.local:11434';
+    process.env.TRANSLATE_MODEL = 'qwen2.5:7b';
+    try {
+      expect(resolveTranslateBaseUrl(baseConfig)).toBe('http://ollama.local:11434');
+      expect(resolveTranslateModel(baseConfig)).toBe('qwen2.5:7b');
+    } finally {
+      process.env.TRANSLATE_BASE_URL = originalBase;
+      process.env.TRANSLATE_MODEL = originalModel;
+    }
+  });
+
+  it('returns undefined when neither config nor env is set', () => {
+    const originalBase = process.env.TRANSLATE_BASE_URL;
+    const originalModel = process.env.TRANSLATE_MODEL;
+    delete process.env.TRANSLATE_BASE_URL;
+    delete process.env.TRANSLATE_MODEL;
+    try {
+      expect(resolveTranslateBaseUrl(baseConfig)).toBeUndefined();
+      expect(resolveTranslateModel(baseConfig)).toBeUndefined();
+    } finally {
+      process.env.TRANSLATE_BASE_URL = originalBase;
+      process.env.TRANSLATE_MODEL = originalModel;
+    }
   });
 });

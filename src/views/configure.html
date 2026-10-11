@@ -224,10 +224,18 @@
     </div>
 
     <div class="lang-section">
-      <label for="translateSearch">Translation (Lingarr) <span class="optional-tag">optional</span></label>
+      <label for="translateSearch">Translation <span class="optional-tag">optional</span></label>
       <div class="lingarr-config">
-        <input type="text" id="lingarrUrl" placeholder="Lingarr URL, e.g. http://localhost:9876" autocomplete="off">
-        <input type="password" id="lingarrKey" placeholder="API key (only if Lingarr auth is enabled)" autocomplete="off">
+        <select id="translateProvider" autocomplete="off">
+          <option value="">— select provider —</option>
+          <option value="google">Google Translate (500K free/month)</option>
+          <option value="deepl">DeepL (500K free/month with :fx key)</option>
+          <option value="openai">OpenAI / OpenRouter / Mistral / xAI / LocalAI / Ollama</option>
+          <option value="anthropic">Anthropic Claude</option>
+        </select>
+        <input type="password" id="translateKey" placeholder="API key" autocomplete="off">
+        <input type="text" id="translateBaseUrl" placeholder="Base URL (only for self-hosted, e.g. http://localhost:11434)" autocomplete="off">
+        <input type="text" id="translateModel" placeholder="Model (optional, provider default used if blank)" autocomplete="off">
       </div>
       <div class="lang-select" id="translateSelect">
         <div class="lang-control" id="translateControl" onclick="toggleTranslateDropdown(event)">
@@ -244,7 +252,7 @@
           </div>
         </div>
       </div>
-      <div class="lang-hint">Fills missing target languages by translating the best source sub via your <a href="https://github.com/lingarr-translate/lingarr" target="_blank" rel="noopener" style="color:#4ecca3">Lingarr</a> instance. Source sub is picked automatically (English preferred).</div>
+      <div class="lang-hint">Fills missing target languages by translating the best source sub via the selected provider. <strong>Free options:</strong> Google Translate and DeepL (<code>:fx</code> key) offer 500K chars/month. Source sub is picked automatically (English preferred).</div>
     </div>
 
     <button class="btn-generate" onclick="generate()">Generate Manifest URL</button>
@@ -774,10 +782,14 @@
       if (selectedLangs.size > 0) {
         params.set('lang', Array.from(selectedLangs).join(','));
       }
-      const lingarrUrl = document.getElementById('lingarrUrl').value.trim();
-      const lingarrKey = document.getElementById('lingarrKey').value.trim();
-      if (lingarrUrl) params.set('lingarr', lingarrUrl);
-      if (lingarrKey) params.set('lingarrKey', lingarrKey);
+      const provider = document.getElementById('translateProvider').value.trim();
+      const providerKey = document.getElementById('translateKey').value.trim();
+      const baseUrl = document.getElementById('translateBaseUrl').value.trim();
+      const model = document.getElementById('translateModel').value.trim();
+      if (provider) params.set('tp', provider);
+      if (providerKey) params.set('tk', providerKey);
+      if (baseUrl) params.set('tbu', baseUrl);
+      if (model) params.set('tm', model);
       if (selectedTranslateLangs.size > 0) {
         Array.from(selectedTranslateLangs).forEach(code => params.append('translate', code));
       }
@@ -889,8 +901,10 @@
       const streams = p.getAll('stream').filter(Boolean);
       const subs = p.getAll('sub').filter(Boolean);
       const langs = (p.get('lang') || '').split(',').map(s => s.trim()).filter(Boolean);
-      const lingarrUrl = p.get('lingarr') || '';
-      const lingarrKey = p.get('lingarrKey') || '';
+      const provider = p.get('tp') || '';
+      const providerKey = p.get('tk') || '';
+      const baseUrl = p.get('tbu') || '';
+      const model = p.get('tm') || '';
       const translateLangs = p.getAll('translate').map(s => s.trim()).filter(Boolean);
 
       if (streams.length) setAddonUrls('stream', streams);
@@ -900,8 +914,10 @@
       renderLangTags();
       initLanguageOptions('');
 
-      if (lingarrUrl) document.getElementById('lingarrUrl').value = lingarrUrl;
-      if (lingarrKey) document.getElementById('lingarrKey').value = lingarrKey;
+      if (provider) document.getElementById('translateProvider').value = provider;
+      if (providerKey) document.getElementById('translateKey').value = providerKey;
+      if (baseUrl) document.getElementById('translateBaseUrl').value = baseUrl;
+      if (model) document.getElementById('translateModel').value = model;
       translateLangs.forEach(code => selectedTranslateLangs.add(code));
       renderTranslateTags();
       initTranslateOptions('');

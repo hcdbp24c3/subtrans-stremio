@@ -1,25 +1,36 @@
 /**
- * Lingarr translation pipeline.
+ * Translation pipeline.
  *
- * Given the upstream sub list, fills missing target languages by translating
- * the best source sub via Lingarr. Caches results in lingarr-cache; serves
- * the translated body through the existing /alignedsub/:token.:ext endpoint
+ * Given the upstream sub list (or a pre-extracted built-in sub), fills missing
+ * target languages by translating the best source sub via the configured
+ * provider (OpenAI / Anthropic / DeepL / Google). Caches results so the same
+ * source + target pair never translates twice within 7 days. Serves the
+ * translated body through the existing /alignedsub/:token.:ext endpoint
  * (same mechanism as the offset-aligned sub cache).
  *
- * Pure orchestration: no Express, no res object. The route module wires it in
- * and handles the response side.
+ * Pure orchestration: no Express, no res object. The route module wires it
+ * in and handles the response side.
+ *
+ * Exported function name `runLingarrPipeline` is kept for backward
+ * compatibility with the previous Lingarr-based pipeline.
  */
 
 import { fetchText } from './proxy.js';
 import { resolveRealUrl } from './proxy-resolve.js';
 import { parseSubtitle, SubtitleEntry, SubtitleFormat } from './subtitle-parser.js';
-import { resolveLingarrUrl, resolveLingarrApiKey, AddonConfig } from '../config.js';
 import {
-  buildTranslateRequest, translateContent, MediaType, pingLingarr,
-} from './lingarr.js';
+  resolveTranslateProvider, resolveTranslateKey,
+  resolveTranslateBaseUrl, resolveTranslateModel, AddonConfig,
+} from '../config.js';
+import {
+  getProvider, TranslationProvider,
+} from './providers/index.js';
+import {
+  type ProviderRequest, type TranslateResult, stitchEntries,
+} from './providers/types.js';
 import {
   getCachedTranslation, setCachedTranslation, CachedTranslation,
-} from './lingarr-cache.js';
+} from './translate-cache.js';
 
 export interface BuiltinSource {
   /**
@@ -45,18 +56,16 @@ export interface LingarrPipelineInput {
    * the budget is too low to finish one round-trip.
    */
   budgetMs: number;
-  /** Hard cap per Lingarr call (ms). */
+  /** Hard cap per translation call (ms). */
   perCallTimeoutMs?: number;
   /**
-   * Injectable for tests. Defaults to the global fetch-based translateContent.
+   * Injectable for tests. Defaults to the configured provider's translate().
    */
-  translate?: typeof translateContent;
+  translate?: (req: ProviderRequest) => Promise<TranslateResult>;
   /**
    * Injectable for tests. Defaults to fetchText.
    */
   fetchSubContent?: typeof fetchText;
-  /** Media type to send to Lingarr (defaults to 'Movie'). */
-  mediaType?: MediaType;
   /**
    * Pre-extracted built-in text sub. When set, used as the translation
    * source in preference to anything in `subs`. Bypasses upstream
@@ -92,185 +101,16 @@ export interface LingarrPipelineOutput {
 export interface LingarrLogEntry {
   target: string;
   source: string;
-  status: 'cache-hit' | 'translated' | 'skipped-budget' | 'no-source' | 'failed' | 'unavailable';
+  status: 'cache-hit' | 'translated' | 'no-source' | 'failed' | 'unavailable' | 'no-provider' | 'no-key';
   detail?: string;
+  provider?: string;
 }
 
 const PER_CALL_TIMEOUT_DEFAULT = 30_000;
-/** Skip Lingarr work when the request budget has less than this much left. */
+/** Skip translation when the request budget has less than this much left. */
 const MIN_BUDGET_MS = 4_000;
-/** Per-language hard cap on Lingarr round-trips for a single request. */
+/** Per-language hard cap on translation round-trips for a single request. */
 const MAX_LANGS_PER_REQUEST = 5;
-
-export async function runLingarrPipeline(
-  input: LingarrPipelineInput,
-): Promise<LingarrPipelineOutput> {
-  const log: LingarrLogEntry[] = [];
-  const baseUrl = resolveLingarrUrl(input.config);
-  if (!baseUrl) {
-    console.log('[lingarr] pipeline skip: no Lingarr URL configured');
-    return { subs: input.subs, translated: false, log };
-  }
-  if (input.budgetMs < MIN_BUDGET_MS) {
-    console.log(`[lingarr] pipeline skip: budget low (${input.budgetMs}ms < ${MIN_BUDGET_MS}ms)`);
-    return { subs: input.subs, translated: false, log };
-  }
-  const targets = (input.config.translateTargets ?? [])
-    .map((c) => c.trim().toLowerCase())
-    .filter(Boolean)
-    .slice(0, MAX_LANGS_PER_REQUEST);
-  if (targets.length === 0) {
-    console.log('[lingarr] pipeline skip: no targets after normalization');
-    return { subs: input.subs, translated: false, log };
-  }
-
-  // Probe Lingarr liveness once per request; if it fails, do not waste time
-  // pinging per language. Cache probe result in a closure to keep the hot path
-  // fast on misses.
-  let probed = false;
-  let available = true;
-  const ensureAvailable = async (): Promise<boolean> => {
-    if (probed) return available;
-    probed = true;
-    available = await pingLingarr(baseUrl, resolveLingarrApiKey(input.config));
-    if (!available) {
-      console.log(`[lingarr] ping failed: ${baseUrl} unreachable or wrong api key`);
-      for (const t of targets) log.push({ target: t, source: '', status: 'unavailable' });
-    } else {
-      console.log(`[lingarr] ping OK: ${baseUrl}`);
-    }
-    return available;
-  };
-
-  const apiKey = resolveLingarrApiKey(input.config);
-  const translate = input.translate ?? translateContent;
-  const fetchSubContent = input.fetchSubContent ?? fetchText;
-
-  const presentLangs = new Set(
-    input.subs
-      .map((s) => (s.normLang ?? '').toLowerCase())
-      .filter(Boolean),
-  );
-  const missingTargets = targets.filter((t) => !presentLangs.has(t));
-  if (missingTargets.length === 0) {
-    return { subs: input.subs, translated: false, log };
-  }
-
-  // Resolve translation source: built-in track wins over upstream subs.
-  // Built-in timing matches the playing video 100% (no release-mismatch risk);
-  // upstream subs may come from a different cut or encoding.
-  const builtinSource = input.builtinSource;
-  const sourceEntries = builtinSource?.entries;
-
-  // Normalized source lang (ISO 639-1) — used as Lingarr sourceLanguage param.
-  const sourceLang = builtinSource
-    ? normalizeLangForPipeline(builtinSource.lang)
-    : (() => {
-        const up = pickBestSource(input.subs);
-        return up ? (up.normLang ?? '').toLowerCase() : '';
-      })();
-
-  // Cache key: real URL for upstream; videoUrl+streamIndex for built-in
-  // (so two different videos never collide on shared upstream content).
-  const sourceCacheKey = builtinSource
-    ? `builtin:${builtinSource.videoUrl}|${builtinSource.streamIndex}`
-    : (() => {
-        const up = pickBestSource(input.subs);
-        return up ? resolveRealUrl(up.url) : '';
-      })();
-
-  if (!sourceLang || !sourceCacheKey) {
-    for (const t of missingTargets) {
-      log.push({ target: t, source: sourceLang, status: 'no-source' });
-    }
-    return { subs: input.subs, translated: false, log };
-  }
-
-  // Synthetic descriptor — used for cache + log + buildSyntheticSub (URL+id).
-  // The actual translation uses the raw `entries` (or fetches upstream).
-  const sourceSub: LingarrSourceSub = builtinSource
-    ? {
-        id: `builtin-${builtinSource.streamIndex}`,
-        url: sourceCacheKey,
-        lang: sourceLang,
-        format: 'srt',
-        normLang: sourceLang,
-        entries: builtinSource.entries,
-      }
-    : pickBestSource(input.subs)!;
-
-  const newSubs: LingarrSourceSub[] = [];
-  let translatedAny = false;
-  for (const target of missingTargets) {
-    if (target === sourceLang) continue;
-    if (!(await ensureAvailable())) break;
-
-    // 1. Cache lookup
-    const cached = getCachedTranslation(sourceCacheKey, sourceLang, target);
-    if (cached) {
-      log.push({ target, source: sourceLang, status: 'cache-hit' });
-      newSubs.push(buildSyntheticSub(sourceSub, target, cached));
-      translatedAny = true;
-      continue;
-    }
-
-    // 2. Built-in: entries already in hand. Upstream: download + parse.
-    let entries: SubtitleEntry[];
-    let fmt: SubtitleFormat;
-    if (builtinSource) {
-      entries = builtinSource.entries;
-      fmt = 'srt';
-    } else {
-      const subContent = await fetchSubContent(sourceCacheKey);
-      if (!subContent) {
-        log.push({ target, source: sourceLang, status: 'failed', detail: 'source fetch failed' });
-        continue;
-      }
-      fmt = sourceSub.format ?? 'srt';
-      const parsed = parseSubtitle(subContent, fmt);
-      if (parsed.length === 0) {
-        log.push({ target, source: sourceLang, status: 'failed', detail: 'source parse empty' });
-        continue;
-      }
-      entries = parsed;
-    }
-
-    // 3. Build request and translate
-    const request = buildTranslateRequest(
-      entries, sourceLang, target, input.mediaType ?? 'Movie',
-    );
-    const result = await translate(
-      { baseUrl, apiKey, timeoutMs: input.perCallTimeoutMs ?? PER_CALL_TIMEOUT_DEFAULT },
-      request,
-    );
-    if (!result.ok || result.lines.size === 0) {
-      log.push({ target, source: sourceLang, status: 'failed' });
-      continue;
-    }
-
-    // 4. Stitch translated lines onto source timestamps
-    const translatedEntries: SubtitleEntry[] = entries.map((e, i) => {
-      const line = result.lines.get(i + 1);
-      return {
-        start: e.start,
-        end: e.end,
-        text: line ?? e.text,
-      };
-    });
-    const value: CachedTranslation = {
-      entries: translatedEntries,
-      format: fmt,
-      sourceLang,
-      targetLang: target,
-    };
-    setCachedTranslation(sourceCacheKey, sourceLang, target, value);
-    newSubs.push(buildSyntheticSub(sourceSub, target, value));
-    log.push({ target, source: sourceLang, status: 'translated' });
-    translatedAny = true;
-  }
-
-  return { subs: [...input.subs, ...newSubs], translated: translatedAny, log };
-}
 
 /** Map a raw ffprobe lang tag (e.g. "eng", "vie") to ISO 639-1 ("en", "vi"). */
 function normalizeLangForPipeline(code: string): string {
@@ -311,4 +151,180 @@ function buildSyntheticSub(
     normLang: targetLang,
     entries: cached.entries,
   };
+}
+
+export async function runLingarrPipeline(
+  input: LingarrPipelineInput,
+): Promise<LingarrPipelineOutput> {
+  const log: LingarrLogEntry[] = [];
+  const providerName = resolveTranslateProvider(input.config);
+
+  if (!providerName) {
+    console.log('[translate] pipeline skip: no translateProvider configured (set tp=openai|anthropic|deepl|google)');
+    return { subs: input.subs, translated: false, log };
+  }
+
+  const provider: TranslationProvider | null = getProvider(providerName);
+  if (!provider) {
+    console.log(`[translate] pipeline skip: unknown provider '${providerName}'`);
+    for (const t of (input.config.translateTargets ?? []).slice(0, MAX_LANGS_PER_REQUEST)) {
+      log.push({ target: t.toLowerCase(), source: '', status: 'no-provider', provider: providerName });
+    }
+    return { subs: input.subs, translated: false, log };
+  }
+
+  const apiKey = resolveTranslateKey(input.config, providerName);
+  if (provider.requiresKey && !apiKey) {
+    console.log(`[translate] pipeline skip: provider '${providerName}' requires an API key`);
+    for (const t of (input.config.translateTargets ?? []).slice(0, MAX_LANGS_PER_REQUEST)) {
+      log.push({ target: t.toLowerCase(), source: '', status: 'no-key', provider: providerName });
+    }
+    return { subs: input.subs, translated: false, log };
+  }
+
+  if (input.budgetMs < MIN_BUDGET_MS) {
+    console.log(`[translate] pipeline skip: budget low (${input.budgetMs}ms < ${MIN_BUDGET_MS}ms)`);
+    return { subs: input.subs, translated: false, log };
+  }
+
+  const targets = (input.config.translateTargets ?? [])
+    .map((c) => c.trim().toLowerCase())
+    .filter(Boolean)
+    .slice(0, MAX_LANGS_PER_REQUEST);
+  if (targets.length === 0) {
+    console.log('[translate] pipeline skip: no targets after normalization');
+    return { subs: input.subs, translated: false, log };
+  }
+
+  const baseUrl = resolveTranslateBaseUrl(input.config);
+  const model = resolveTranslateModel(input.config);
+  const translate = input.translate ?? ((req) => provider.translate(
+    { apiKey: apiKey ?? '', baseUrl, model, timeoutMs: input.perCallTimeoutMs ?? PER_CALL_TIMEOUT_DEFAULT },
+    req,
+  ));
+  const fetchSubContent = input.fetchSubContent ?? fetchText;
+
+  console.log(`[translate] using provider: ${providerName}`);
+
+  const presentLangs = new Set(
+    input.subs
+      .map((s) => (s.normLang ?? '').toLowerCase())
+      .filter(Boolean),
+  );
+  const missingTargets = targets.filter((t) => !presentLangs.has(t));
+  if (missingTargets.length === 0) {
+    return { subs: input.subs, translated: false, log };
+  }
+
+  // Resolve translation source: built-in track wins over upstream subs.
+  const builtinSource = input.builtinSource;
+  const sourceEntries = builtinSource?.entries;
+
+  const sourceLang = builtinSource
+    ? normalizeLangForPipeline(builtinSource.lang)
+    : (() => {
+        const up = pickBestSource(input.subs);
+        return up ? (up.normLang ?? '').toLowerCase() : '';
+      })();
+
+  const sourceCacheKey = builtinSource
+    ? `builtin:${builtinSource.videoUrl}|${builtinSource.streamIndex}`
+    : (() => {
+        const up = pickBestSource(input.subs);
+        return up ? resolveRealUrl(up.url) : '';
+      })();
+
+  if (!sourceLang || !sourceCacheKey) {
+    for (const t of missingTargets) {
+      log.push({ target: t, source: sourceLang, status: 'no-source' });
+    }
+    return { subs: input.subs, translated: false, log };
+  }
+
+  const sourceSub: LingarrSourceSub = builtinSource
+    ? {
+        id: `builtin-${builtinSource.streamIndex}`,
+        url: sourceCacheKey,
+        lang: sourceLang,
+        format: 'srt',
+        normLang: sourceLang,
+        entries: builtinSource.entries,
+      }
+    : pickBestSource(input.subs)!;
+
+  const newSubs: LingarrSourceSub[] = [];
+  let translatedAny = false;
+  for (const target of missingTargets) {
+    if (target === sourceLang) continue;
+
+    // 1. Cache lookup
+    const cached = getCachedTranslation(providerName, sourceCacheKey, sourceLang, target);
+    if (cached) {
+      log.push({ target, source: sourceLang, status: 'cache-hit' });
+      newSubs.push(buildSyntheticSub(sourceSub, target, cached));
+      translatedAny = true;
+      continue;
+    }
+
+    // 2. Built-in: entries already in hand. Upstream: download + parse.
+    let entries: SubtitleEntry[];
+    let fmt: SubtitleFormat;
+    if (builtinSource) {
+      entries = builtinSource.entries;
+      fmt = 'srt';
+    } else {
+      const subContent = await fetchSubContent(sourceCacheKey);
+      if (!subContent) {
+        log.push({ target, source: sourceLang, status: 'failed', detail: 'source fetch failed' });
+        continue;
+      }
+      fmt = sourceSub.format ?? 'srt';
+      const parsed = parseSubtitle(subContent, fmt);
+      if (parsed.length === 0) {
+        log.push({ target, source: sourceLang, status: 'failed', detail: 'source parse empty' });
+        continue;
+      }
+      entries = parsed;
+    }
+
+    // 3. Build request and translate
+    const req: ProviderRequest = {
+      sourceLanguage: sourceLang,
+      targetLanguage: target,
+      lines: entries,
+    };
+    const result = await translate(req);
+    if (!result.ok || result.lines.size === 0) {
+      log.push({
+        target, source: sourceLang, status: 'failed',
+        detail: result.reason ?? 'empty translations', provider: providerName,
+      });
+      continue;
+    }
+
+    // 4. Stitch translated lines onto source timestamps
+    const translatedEntries = stitchEntries(entries, result.lines);
+    setCachedTranslation(
+      providerName,
+      sourceCacheKey,
+      sourceLang,
+      target,
+      {
+        entries: translatedEntries,
+        format: fmt,
+        provider: providerName,
+      },
+    );
+    newSubs.push(buildSyntheticSub(sourceSub, target, {
+      entries: translatedEntries,
+      format: fmt,
+      sourceLang,
+      targetLang: target,
+      provider: providerName,
+    }));
+    log.push({ target, source: sourceLang, status: 'translated', provider: providerName });
+    translatedAny = true;
+  }
+
+  return { subs: [...input.subs, ...newSubs], translated: translatedAny, log };
 }
