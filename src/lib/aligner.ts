@@ -254,24 +254,26 @@ export function findBestRefSubtitleStream(videoUrl: string): SubtitleStreamInfo 
  * the byte offset in the file, or null if not found.
  */
 function probeFirstPacketPos(videoUrl: string, streamIndex: number, timeoutMs: number): number | null {
+  // Use -read_intervals %+#500 to only scan first 500 MB. For a 30-80 GB
+  // torrent, the sub track's first cluster is usually within 500 MB; if
+  // it's later we'll fall back to scanning the whole file (slower).
+  // -select_streams <n> limits to the target sub only, dramatically
+  // reducing output size + scan time.
   try {
     const out = execSync(
-      `ffprobe -v error -select_streams s -show_entries packet=stream_index,pos -of csv=p=0 "${videoUrl}" 2>/dev/null`,
+      `ffprobe -v error -read_intervals '%+#500' -select_streams ${streamIndex} -show_entries packet=stream_index,pos -of csv=p=0 "${videoUrl}" 2>/dev/null | head -1`,
       { encoding: 'utf-8', timeout: timeoutMs },
     ).trim();
-    for (const line of out.split('\n')) {
-      const parts = line.split(',');
-      if (parts.length < 2) continue;
-      const idx = parseInt(parts[0], 10);
-      const pos = parseInt(parts[1], 10);
-      if (idx === streamIndex && !isNaN(pos) && pos > 0) {
-        return pos;
-      }
-    }
+    if (!out) return null;
+    const parts = out.split(',');
+    if (parts.length < 2) return null;
+    const idx = parseInt(parts[0], 10);
+    const pos = parseInt(parts[1], 10);
+    if (idx !== streamIndex || isNaN(pos) || pos <= 0) return null;
+    return pos;
   } catch {
-    // fall through
+    return null;
   }
-  return null;
 }
 
 export async function extractBuiltinSubtitle(
@@ -291,7 +293,11 @@ export async function extractBuiltinSubtitle(
     // tells us the byte offset of the cluster that contains the first
     // dialogue cue. On 30-80 GB torrents this offset can be 200-400 MB
     // into the file — naive "download first 32 MB" never reaches it.
-    const probeBudget = Math.max(5, Math.min(10, timeoutSec - 20));
+    //
+    // ffprobe scan over a 30 GB file takes ~7s even with packet filtering
+    // (it has to walk the EBML tree). Use a 20s budget so it always has
+    // time to find the track on slower CDNs.
+    const probeBudget = Math.max(8, Math.min(20, timeoutSec - 8));
     const firstPos = probeFirstPacketPos(safeUrl, streamIndex, probeBudget * 1000);
     if (firstPos === null) {
       console.log(`[aligner] probe: no sub packets found for track ${streamIndex}`);
