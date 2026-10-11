@@ -1053,20 +1053,38 @@
       window.open(webUrl, '_blank', 'noopener');
     }
 
-    // ── Reconfig: parse ?config=… (or stream/sub/lang params) ──
-    function loadConfigFromUrl() {
-      const search = new URLSearchParams(window.location.search);
-      let cfg = search.get('config');
+    // ── Reconfig: parse ?config=… OR /<config>/configure (path segment) ──
+    function pathSegmentToConfig(seg) {
+      if (!seg || !/^[A-Za-z0-9_-]{20,}$/.test(seg)) return null;
+      try {
+        const b64 = seg.replace(/-/g, '+').replace(/_/g, '/');
+        const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+        return decodeURIComponent(escape(atob(padded)));
+      } catch {
+        return null;
+      }
+    }
 
-      // Also accept flat params: /configure?stream=…&stream=…&sub=…&lang=…
+    function loadConfigFromUrl() {
+      // 1. Path segment config: /<base64url(config)>/configure
+      const pathParts = window.location.pathname.split('/').filter(Boolean);
+      let cfg = pathParts.length > 0 ? pathSegmentToConfig(pathParts[0]) : null;
+
+      // 2. Query string ?config=… (legacy)
       if (!cfg) {
-        const flat = new URLSearchParams();
-        let any = false;
-        search.getAll('stream').forEach(v => { flat.append('stream', v); any = true; });
-        search.getAll('sub').forEach(v => { flat.append('sub', v); any = true; });
-        const lang = search.get('lang');
-        if (lang) { flat.set('lang', lang); any = true; }
-        if (any) cfg = flat.toString();
+        const search = new URLSearchParams(window.location.search);
+        cfg = search.get('config');
+
+        // Also accept flat params: /configure?stream=…&stream=…&sub=…&lang=…
+        if (!cfg) {
+          const flat = new URLSearchParams();
+          let any = false;
+          search.getAll('stream').forEach(v => { flat.append('stream', v); any = true; });
+          search.getAll('sub').forEach(v => { flat.append('sub', v); any = true; });
+          const lang = search.searchParams.get('lang');
+          if (lang) { flat.set('lang', lang); any = true; }
+          if (any) cfg = flat.toString();
+        }
       }
 
       if (!cfg) return false;
