@@ -295,7 +295,7 @@ export async function extractBuiltinSubtitle(
     // background full extract (up to 30s) when this fails; the next
     // /subtitles request hits the warmed cache. So here we attempt
     // foreground but don't burn too much time on it.
-    if (input.budgetMs < 4_000) {
+    if (timeoutSec < 4) {
       return null; // route would skip anyway
     }
     const probeBudget = 8; // seconds; ffprobe scan over a 30 GB file is ~5-8s
@@ -309,12 +309,12 @@ export async function extractBuiltinSubtitle(
     // Best-effort foreground extract: small window (~32 MB) starting at
     // the cluster header. If the actual sub data is past the window,
     // ffmpeg reports "Stream map matches no streams" and we return null
-    // so the route schedules a full background extract. Most of the
+    // so the route schedules a background extract. Most of the
     // 30s budget goes to the background path on the second request.
     const WINDOW = 32 * 1024 * 1024; // 32 MB
     const rangeStart = Math.max(0, firstPos - 64 * 1024);
     const rangeEnd = rangeStart + WINDOW - 1;
-    const curlBudget = Math.max(6, Math.min(12, input.budgetMs / 1000 - 2));
+    const curlBudget = Math.max(6, Math.min(12, timeoutSec - 2));
     const curlCmd =
       `timeout ${curlBudget} curl -sSL ` +
       `-A "Mozilla/5.0" ` +
