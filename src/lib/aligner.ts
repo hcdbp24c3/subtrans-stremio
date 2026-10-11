@@ -255,45 +255,80 @@ export async function extractBuiltinSubtitle(
   timeoutSec = 30,
 ): Promise<string | null> {
   const tmpFile = join(tmpdir(), `builtin_sub_${streamIndex}_${Date.now()}.srt`);
+  const stderrFile = join(tmpdir(), `builtin_sub_${streamIndex}_${Date.now()}.err`);
+  // Two-step extract that's robust on slow torrent CDNs:
+  //   1. Use curl (not ffmpeg) to fetch the first 4 MB of the video with a
+  //      proper Range header. curl handles redirects + Range natively and is
+  //      faster on throttled CDNs than ffmpeg's internal HTTP client.
+  //   2. Feed the partial file to ffmpeg locally (no network) with a small
+  //      timeout — pure local I/O, no more network risk.
+  //
+  // ffmpeg-on-streaming-URL was timing out at 30s because the probe
+  // (probesize) needed to download enough bytes to locate the sub track,
+  // and torrent CDNs throttle non-browser clients.
+
+  const partialFile = join(tmpdir(), `builtin_video_${streamIndex}_${Date.now()}.mkv`);
   // Escape the URL for shell — torrentio URLs contain '&', '?', etc. that
   // would be interpreted as shell metacharacters without quoting.
   const safeUrl = videoUrl.replace(/(["'$`\\])/g, '\\$1');
-  // -sn: only scan subtitle streams (skip video/audio analysis = much faster
-  //       for large files where ffprobe would otherwise scan GBs of packets)
-  // -probesize 4M: only analyze the first 4MB. Most MKV text subs have their
-  //                  timing data in the first cluster; 4M is enough for 99%
-  //                  of files and avoids 60s+ waits on 30GB torrents.
-  //                  (Previously 64M — way too slow on torrent streams.)
-  // -analyzeduration 0: don't waste time on A/V analysis
-  // -t 600: only read first 10 minutes. Sub tracks almost always have
-  //          content in the first few minutes; if ffmpeg timeouts the
-  //          partial file recovery still gets useful cues.
-  // -c:s srt: re-mux to plain SRT
-  // -user_agent: torrentio/torbox reject empty User-Agent; pass a browser
-  //              UA so the server returns real bytes instead of an error
-  // -reconnect 1: reconnect on transient errors (Torbox CDN flaky)
-  // -loglevel error: keep stderr minimal so our catch sees only the real
-  //                  error message
-  const cmd =
-    `timeout ${timeoutSec} ffmpeg -y -loglevel error ` +
-    `-probesize 4M -analyzeduration 0 -sn ` +
-    `-user_agent "Mozilla/5.0" -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 ` +
-    `-i "${safeUrl}" -t 600 ` +
-    `-map 0:${streamIndex} -c:s srt -f srt "${tmpFile}" 2>&1`;
+
+  // Step 1: download first 4 MB via curl (separate timeout — most of the
+  // 30s budget goes here; if curl succeeds, ffmpeg is instant on the
+  // local partial file).
+  const curlBudget = Math.max(10, timeoutSec - 6);
+  const curlCmd =
+    `timeout ${curlBudget} curl -sSL ` +
+    `-A "Mozilla/5.0" ` +
+    `-H "Range: bytes=0-4194303" ` +
+    `--max-time ${curlBudget - 1} ` +
+    `-o "${partialFile}" ` +
+    `"${safeUrl}" 2>"${stderrFile}"`;
+
   try {
-    console.log(`[aligner] Extracting builtin sub stream ${streamIndex} (timeout ${timeoutSec}s)...`);
-    await execAsync(cmd, (timeoutSec + 15) * 1000);
+    console.log(`[aligner] Downloading first 4 MB of video via curl (${curlBudget}s budget)...`);
+    await execAsync(curlCmd, (curlBudget + 5) * 1000);
+
+    if (!existsSync(partialFile)) {
+      console.log(`[aligner] curl produced no output file`);
+      return null;
+    }
+    const stat = statSync(partialFile);
+    console.log(`[aligner] Downloaded ${stat.size} bytes; extracting track ${streamIndex} via local ffmpeg`);
+    if (stat.size < 1000) {
+      const err = readFileSync(stderrFile, 'utf-8').trim();
+      console.log(`[aligner] Download too small (${stat.size} bytes); server rejected. stderr: ${err.slice(0, 200)}`);
+      unlinkSync(partialFile);
+      return null;
+    }
+
+    // Step 2: ffmpeg reads from the local partial file — no network,
+    // no probe limit, no redirect, no UA. Should finish in <1 second.
+    const ffmpegTimeout = 6;
+    const ffmpegCmd =
+      `timeout ${ffmpegTimeout} ffmpeg -y -loglevel error ` +
+      `-i "${partialFile}" ` +
+      `-map 0:${streamIndex} -c:s srt -f srt "${tmpFile}" 2>>"${stderrFile}"`;
+    await execAsync(ffmpegCmd, (ffmpegTimeout + 2) * 1000);
+
     if (existsSync(tmpFile)) {
       const content = readFileSync(tmpFile, 'utf-8');
       try { unlinkSync(tmpFile); } catch {}
+      try { unlinkSync(partialFile); } catch {}
+      try { unlinkSync(stderrFile); } catch {}
       if (content.trim().length > 0) {
         console.log(`[aligner] Extracted builtin sub: ${content.length} bytes, ${countSrtEntries(content)} entries`);
         return content;
       }
     }
+    // ffmpeg exited cleanly but produced no content
+    if (existsSync(stderrFile)) {
+      const err = readFileSync(stderrFile, 'utf-8');
+      const tail = err.trim().split('\n').slice(-3).join(' | ');
+      console.log(`[aligner] ffmpeg produced no sub content. stderr: ${tail}`);
+    }
     return null;
   } catch (e: any) {
-    // Timeout may leave partial file — recover it
+    // Step 1 (curl) or step 2 (ffmpeg) failed
     if (existsSync(tmpFile)) {
       try {
         const content = readFileSync(tmpFile, 'utf-8');
@@ -304,9 +339,20 @@ export async function extractBuiltinSubtitle(
         }
       } catch {}
     }
-    try { unlinkSync(tmpFile); } catch {}
-    console.log(`[aligner] Builtin sub extraction failed: ${e.message?.substring(0, 200)}`);
+    let errTail = '';
+    if (existsSync(stderrFile)) {
+      try {
+        const err = readFileSync(stderrFile, 'utf-8');
+        errTail = err.trim().split('\n').slice(-3).join(' | ');
+      } catch {}
+    }
+    console.log(`[aligner] Builtin sub extraction failed: ${e.message?.substring(0, 100)} | stderr: ${errTail || '(empty)'}`);
     return null;
+  } finally {
+    // Always clean up the partial video file — it's potentially 4 MB
+    for (const f of [tmpFile, partialFile, stderrFile]) {
+      try { unlinkSync(f); } catch {}
+    }
   }
 }
 
