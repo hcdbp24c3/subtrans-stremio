@@ -153,6 +153,9 @@
     .lingarr-config input:focus,
     .lingarr-config select:focus { outline: none; border-color: #e94560; }
     .lingarr-config option { background: #0f3460; color: #eee; }
+    .lingarr-config input:required,
+    .lingarr-config select:required { border-color: #e94560; }
+    .lingarr-hint { font-size: 11px; color: #888; margin-top: 4px; font-style: italic; }
 
     /* Generate + open buttons */
     .btn-generate {
@@ -242,29 +245,30 @@
       <label for="translateSearch">Translation <span class="optional-tag">optional</span></label>
       <div class="lingarr-config">
         <select id="translateProvider" autocomplete="off">
-          <option value="" data-needs-key="false" data-needs-base="false" data-needs-model="false">— select provider —</option>
+          <option value="" data-key="none" data-base="none" data-model="none">— select provider —</option>
           <optgroup label="Free / cheap">
-            <option value="google" data-needs-key="true" data-needs-base="false" data-needs-model="false">Google Translate (500K chars/month)</option>
-            <option value="deepl" data-needs-key="true" data-needs-base="false" data-needs-model="false">DeepL (500K chars/month with :fx key)</option>
-            <option value="libretranslate" data-needs-key="false" data-needs-base="true" data-needs-model="false">LibreTranslate (self-host, free)</option>
-            <option value="ollama" data-needs-key="false" data-needs-base="true" data-needs-model="true">Ollama (local, free)</option>
+            <option value="google" data-key="required" data-base="none" data-model="none">Google Translate (500K chars/month)</option>
+            <option value="deepl" data-key="required" data-base="none" data-model="none">DeepL (500K chars/month with :fx key)</option>
+            <option value="libretranslate" data-key="optional" data-base="optional" data-model="none">LibreTranslate (self-host, free)</option>
+            <option value="ollama" data-key="none" data-base="required" data-model="required">Ollama (local, free)</option>
           </optgroup>
           <optgroup label="LLM providers (paid)">
-            <option value="openai" data-needs-key="true" data-needs-base="false" data-needs-model="false">OpenAI (gpt-4o-mini)</option>
-            <option value="anthropic" data-needs-key="true" data-needs-base="false" data-needs-model="false">Anthropic Claude (haiku-4-5)</option>
-            <option value="gemini" data-needs-key="true" data-needs-base="false" data-needs-model="false">Google Gemini (gemini-2.0-flash)</option>
-            <option value="mistral" data-needs-key="true" data-needs-base="false" data-needs-model="false">Mistral AI (mistral-small)</option>
-            <option value="xai" data-needs-key="true" data-needs-base="false" data-needs-model="false">xAI Grok</option>
-            <option value="openrouter" data-needs-key="true" data-needs-base="false" data-needs-model="false">OpenRouter (multi-model)</option>
+            <option value="openai" data-key="required" data-base="optional" data-model="optional">OpenAI (gpt-4o-mini)</option>
+            <option value="anthropic" data-key="required" data-base="none" data-model="optional">Anthropic Claude (haiku-4-5)</option>
+            <option value="gemini" data-key="required" data-base="none" data-model="optional">Google Gemini (gemini-2.0-flash)</option>
+            <option value="mistral" data-key="required" data-base="none" data-model="optional">Mistral AI (mistral-small)</option>
+            <option value="xai" data-key="required" data-base="none" data-model="optional">xAI Grok</option>
+            <option value="openrouter" data-key="required" data-base="none" data-model="optional">OpenRouter (multi-model)</option>
           </optgroup>
           <optgroup label="Paid / legacy">
-            <option value="bing" data-needs-key="true" data-needs-base="false" data-needs-model="false">Microsoft Bing Translator</option>
-            <option value="yandex" data-needs-key="true" data-needs-base="false" data-needs-model="false">Yandex Translate</option>
+            <option value="bing" data-key="required" data-base="none" data-model="none">Microsoft Bing Translator</option>
+            <option value="yandex" data-key="required" data-base="none" data-model="none">Yandex Translate</option>
           </optgroup>
         </select>
-        <input type="password" id="translateKey" placeholder="API key" autocomplete="off" hidden>
-        <input type="text" id="translateBaseUrl" placeholder="Base URL (e.g. http://localhost:11434 for Ollama)" autocomplete="off" hidden>
-        <input type="text" id="translateModel" placeholder="Model (optional, e.g. llama3.1:8b)" autocomplete="off" hidden>
+        <input type="password" id="translateKey" placeholder="" autocomplete="off" hidden>
+        <input type="text" id="translateBaseUrl" placeholder="" autocomplete="off" hidden>
+        <input type="text" id="translateModel" placeholder="" autocomplete="off" hidden>
+        <div class="lingarr-hint" id="translateFieldHint" hidden></div>
       </div>
       <div class="lang-select" id="translateSelect">
         <div class="lang-control" id="translateControl" onclick="toggleTranslateDropdown(event)">
@@ -737,8 +741,83 @@
     }
 
     // Show/hide API key / Base URL / Model fields based on selected provider's
-    // data-needs-* attributes. Self-hosted providers (Ollama, LibreTranslate)
-    // don't need a key; paid providers don't need a custom Base URL; etc.
+    // data-key / data-base / data-model attributes ('required' | 'optional' | 'none').
+    // Also set per-field placeholder so the user knows what to enter.
+    const PROVIDER_META = {
+      google: {
+        key: 'Google API key (e.g. AIza...)',
+        base: '',
+        model: '',
+        keyRequired: true,
+      },
+      deepl: {
+        key: 'DeepL API key (free :fx key ends with :fx)',
+        base: '',
+        model: '',
+        keyRequired: true,
+      },
+      libretranslate: {
+        key: 'API key (optional — public instance works without one)',
+        base: 'Base URL (e.g. https://libretranslate.com or your self-host)',
+        model: '',
+        keyRequired: false,
+      },
+      ollama: {
+        key: '',
+        base: 'Base URL (default http://localhost:11434)',
+        model: 'Model (e.g. llama3.1:8b, mistral, qwen2.5:7b)',
+        keyRequired: false,
+      },
+      openai: {
+        key: 'OpenAI API key (sk-...)',
+        base: 'Base URL (leave blank for api.openai.com; or your proxy)',
+        model: 'Model (default gpt-4o-mini; e.g. gpt-4o, gpt-4.1, o1-mini)',
+        keyRequired: true,
+      },
+      anthropic: {
+        key: 'Anthropic API key (sk-ant-...)',
+        base: '',
+        model: 'Model (default claude-haiku-4-5; e.g. claude-sonnet-4-5)',
+        keyRequired: true,
+      },
+      gemini: {
+        key: 'Google AI Studio API key (AIza...)',
+        base: '',
+        model: 'Model (default gemini-2.0-flash; e.g. gemini-2.5-pro)',
+        keyRequired: true,
+      },
+      mistral: {
+        key: 'Mistral API key',
+        base: '',
+        model: 'Model (default mistral-small-latest; e.g. mistral-large-latest)',
+        keyRequired: true,
+      },
+      xai: {
+        key: 'xAI API key',
+        base: '',
+        model: 'Model (default grok-2-latest; e.g. grok-3)',
+        keyRequired: true,
+      },
+      openrouter: {
+        key: 'OpenRouter API key (sk-or-...)',
+        base: '',
+        model: 'Model (required: e.g. anthropic/claude-3.5-haiku, openai/gpt-4o-mini)',
+        keyRequired: true,
+      },
+      bing: {
+        key: 'Azure subscription key (Ocp-Apim-Subscription-Key)',
+        base: '',
+        model: '',
+        keyRequired: true,
+      },
+      yandex: {
+        key: 'Yandex Cloud API key (Api-Key)',
+        base: '',
+        model: '',
+        keyRequired: true,
+      },
+    };
+
     function updateTranslateFields() {
       const sel = document.getElementById('translateProvider');
       const opt = sel.selectedOptions[0];
@@ -746,18 +825,44 @@
       const keyInput = document.getElementById('translateKey');
       const baseInput = document.getElementById('translateBaseUrl');
       const modelInput = document.getElementById('translateModel');
+      const hint = document.getElementById('translateFieldHint');
+
+      // Helper: show field only when the attribute is required or optional.
+      const setField = (input, value, placeholder) => {
+        if (value === 'required' || value === 'optional') {
+          input.hidden = false;
+          input.required = value === 'required';
+          input.placeholder = placeholder || '';
+        } else {
+          input.hidden = true;
+          input.required = false;
+        }
+      };
+
       if (!provider || !opt) {
-        keyInput.hidden = true;
-        baseInput.hidden = true;
-        modelInput.hidden = true;
+        keyInput.hidden = true; baseInput.hidden = true; modelInput.hidden = true;
+        hint.hidden = true;
         return;
       }
-      const needsKey = opt.getAttribute('data-needs-key') === 'true';
-      const needsBase = opt.getAttribute('data-needs-base') === 'true';
-      const needsModel = opt.getAttribute('data-needs-model') === 'true';
-      keyInput.hidden = !needsKey;
-      baseInput.hidden = !needsBase;
-      modelInput.hidden = !needsModel;
+      const keyAttr = opt.getAttribute('data-key') || 'none';
+      const baseAttr = opt.getAttribute('data-base') || 'none';
+      const modelAttr = opt.getAttribute('data-model') || 'none';
+      const meta = PROVIDER_META[provider] || {};
+      setField(keyInput, keyAttr, meta.key);
+      setField(baseInput, baseAttr, meta.base);
+      setField(modelInput, modelAttr, meta.model);
+
+      // Show a contextual hint when only one of (base, model) is needed.
+      const optionals = [];
+      if (keyAttr === 'optional') optionals.push('API key (optional)');
+      if (baseAttr === 'optional') optionals.push('Base URL (optional)');
+      if (modelAttr === 'optional') optionals.push('Model (optional)');
+      if (optionals.length > 0) {
+        hint.textContent = 'Optional: ' + optionals.join(' · ');
+        hint.hidden = false;
+      } else {
+        hint.hidden = true;
+      }
     }
 
     function clearTranslateLangs() {
