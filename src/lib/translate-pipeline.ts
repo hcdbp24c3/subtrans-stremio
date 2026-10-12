@@ -109,11 +109,17 @@ function normalizeLangForPipeline(code: string): string {
  */
 function pickBestSource(subs: LingarrSourceSub[]): LingarrSourceSub | null {
   if (subs.length === 0) return null;
+  // Use the (already normalized) normLang when available; fall back to
+  // the raw `lang` field, then to the first sub with any lang set.
+  // normalizeLangForPipeline() at the call site handles any 3-letter
+  // ISO 639-2/B variant (eng, vie, jpn, etc.).
   const eng = subs.find((s) => {
-    const lang = (s.normLang ?? '').toLowerCase();
+    const lang = (s.normLang ?? s.lang ?? '').toLowerCase();
     return lang === 'en' || lang === 'eng';
   });
-  return eng ?? subs[0];
+  if (eng) return eng;
+  const anyLang = subs.find((s) => (s.lang ?? '').trim().length > 0);
+  return anyLang ?? subs[0];
 }
 
 function buildSyntheticSub(
