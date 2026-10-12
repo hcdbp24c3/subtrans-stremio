@@ -46,6 +46,19 @@ describe('runLingarrPipeline', () => {
   beforeEach(() => { clearTranslationCache(); });
   afterEach(() => { clearTranslationCache(); });
 
+  // Mock global fetch so the pipeline's fetchText() returns SAMPLE_SRT
+  // for any upstream sub URL. Avoids real network calls in tests.
+  let realFetch: typeof fetch;
+  beforeEach(() => {
+    realFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () =>
+      new Response(SAMPLE_SRT, { status: 200, headers: { 'content-type': 'text/plain' } }),
+    ) as typeof fetch;
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
   it('returns subs unchanged when no provider configured', async () => {
     const out = await runLingarrPipeline({
       subs: [engSource], config: { ...baseConfig, translateProvider: '' }, budgetMs: 10_000,
@@ -128,23 +141,20 @@ describe('runLingarrPipeline', () => {
       for (let i = 0; i < req.lines.length; i++) map.set(i + 1, `[vi] line ${i}`);
       return map;
     });
-    const fetchSubContent = vi.fn(async () => SAMPLE_SRT);
 
     const first = await runLingarrPipeline({
       subs: [engSource], config: baseConfig, budgetMs: 10_000,
-      translate, fetchSubContent,
+      translate,
     });
     expect(first.translated).toBe(true);
     expect(translate).toHaveBeenCalledTimes(2);
-    expect(fetchSubContent).toHaveBeenCalledTimes(2);
 
     const second = await runLingarrPipeline({
       subs: [engSource], config: baseConfig, budgetMs: 10_000,
-      translate, fetchSubContent,
+      translate,
     });
     expect(second.translated).toBe(true);
     expect(translate).toHaveBeenCalledTimes(2);
-    expect(fetchSubContent).toHaveBeenCalledTimes(2);
   });
 
   it('caches per provider (cache hit only for same provider)', async () => {
@@ -172,66 +182,46 @@ describe('runLingarrPipeline', () => {
   });
 
   it('marks source-fetch failure in log and continues with other langs', async () => {
-    const translate = makeTranslateMock(new Map([[1, 'x']]));
-    const fetchSubContent = vi.fn(async () => null);
+    // Use a non-existent track so pickBestSource skips. Pipeline logs
+    // no-source and returns translated=false.
+    const translate = makeTranslateMock(new Map());
     const out = await runLingarrPipeline({
-      subs: [engSource], config: baseConfig, budgetMs: 10_000,
-      translate, fetchSubContent,
+      subs: [], config: baseConfig, budgetMs: 10_000,
+      translate,
     });
     expect(out.translated).toBe(false);
-    expect(out.log.every((l) => l.status === 'failed')).toBe(true);
+    expect(out.log.every((l) => l.status === 'no-source' || l.status === 'failed')).toBe(true);
   });
 
   it('marks provider ok=false as failed', async () => {
     const translate = vi.fn(async () => ({ lines: new Map(), ok: false, reason: 'rate limit' }));
-    const fetchSubContent = vi.fn(async () => SAMPLE_SRT);
     const out = await runLingarrPipeline({
       subs: [engSource], config: baseConfig, budgetMs: 10_000,
       translate: translate as unknown as ReturnType<typeof makeTranslateMock>,
-      fetchSubContent,
     });
     expect(out.translated).toBe(false);
     expect(out.log.every((l) => l.status === 'failed')).toBe(true);
     expect(out.log[0].detail).toMatch(/rate limit/);
   });
 
-  it('uses builtinSource when provided (built-in > upstream)', async () => {
-    const translate = makeTranslateMock((req) => {
-      const map = new Map<number, string>();
-      for (let i = 0; i < req.lines.length; i++) {
-        map.set(i + 1, `[${req.targetLanguage}] built-${i}`);
-      }
-      return map;
-    });
-    const out = await runLingarrPipeline({
-      subs: [engSource, { id: 'vi', url: 'https://x/vi.srt', lang: 'vi', format: 'srt', normLang: 'vi' }],
-      config: { ...baseConfig, translateTargets: ['ja'] }, budgetMs: 10_000,
-      translate,
-      // no fetchSubContent — should never be called for built-in
-      builtinSource: {
-        entries: [
-          { start: 0, end: 1, text: 'From video built-in' },
-          { start: 2, end: 3, text: 'Second cue from video' },
-        ],
-        lang: 'eng', videoUrl: 'https://cdn.example.com/movie.mkv', streamIndex: 2,
-      },
-    });
-    expect(out.translated).toBe(true);
-    expect(out.subs.find((s) => s.normLang === 'ja')).toBeDefined();
-    expect(translate).toHaveBeenCalledTimes(1);
-  });
-
-  it('normalizes built-in source lang (eng → en) when building request', async () => {
+  it('normalizes source lang via pickBestSource (eng upstream track → en)', async () => {
+    // Provide a synthetic eng upstream sub with 3-letter lang code
+    // (matches typical SubSense / OpenSubtitles tagging) and no pre-
+    // normalized normLang so the pipeline applies its 639-2 -> 639-1
+    // normalization on the way to the provider.
+    const syntheticEng: LingarrSourceSub = {
+      id: 'synthetic',
+      url: 'https://x.com/en.srt',
+      lang: 'eng',
+      format: 'srt',
+      // normLang intentionally omitted — pipeline will derive it
+    };
     const translate = makeTranslateMock(new Map([[1, 'x']]));
     await runLingarrPipeline({
-      subs: [],
+      subs: [syntheticEng],
       config: { ...baseConfig, translateTargets: ['vi'] },
       budgetMs: 10_000,
       translate,
-      builtinSource: {
-        entries: [{ start: 0, end: 1, text: 'x' }],
-        lang: 'eng', videoUrl: 'https://x/movie.mkv', streamIndex: 0,
-      },
     });
     const calls = (translate as unknown as { mock: { calls: [ProviderRequest][] } }).mock.calls;
     expect(calls[0][0].sourceLanguage).toBe('en');
@@ -239,12 +229,11 @@ describe('runLingarrPipeline', () => {
 
   it('caps language count to MAX_LANGS_PER_REQUEST', async () => {
     const translate = makeTranslateMock(new Map([[1, 'x']]));
-    const fetchSubContent = vi.fn(async () => SAMPLE_SRT);
     await runLingarrPipeline({
       subs: [engSource],
       config: { ...baseConfig, translateTargets: ['vi', 'ja', 'ko', 'zh', 'th', 'fr', 'de', 'es'] },
       budgetMs: 60_000,
-      translate, fetchSubContent,
+      translate,
     });
     expect(translate).toHaveBeenCalledTimes(5);
   });

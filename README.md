@@ -66,12 +66,12 @@ Self-hosted OpenAI-compatible servers (LocalAI, Ollama, vLLM, LM Studio) all wor
 The pipeline:
 
 - Detects which target languages (e.g. `vi`, `ja`) are missing from the upstream sub addons
-- Picks the best available source — either an upstream sub or, when no upstream subs are available, a **text track extracted from the video itself** via ffmpeg (background, non-blocking — first request returns 0 subs while the track is being extracted; subsequent requests serve the cached translation)
+- Picks the best available source sub (English first, then first available)
 - Translates it via the configured provider
 - Stitches the translated lines back onto the source sub's timestamps
-- Caches the result (7 days for translations, 24h for extracted built-in tracks) and serves it as if it were a regular sub
+- Caches the result (7 days per source+target+provider) and serves it as if it were a regular sub
 
-Translation is **optional**. Without it, the addon behaves exactly as before. The translation tier adds at most one round-trip per missing target language, and never blocks past the existing 14s request budget. Built-in extraction runs in the background (does not block the response) and only happens when no upstream subs are present.
+Translation is **optional**. Without it, the addon behaves exactly as before. The translation tier adds at most one round-trip per missing target language, and never blocks past the existing 14s request budget. **Sub source is always the upstream sub addon** — install a sub addon (OpenSubtitles, Stremio Community Subs, etc.) in `/configure` to enable translation. If no sub addon is configured, the addon returns an empty subtitle list.
 
 Per-user config (configure page) wins over environment variables.
 
@@ -99,7 +99,7 @@ Stremio → Alignment Addon → Stream Addon (proxy)
 |----------|---------|-------------|
 | PORT | 5100 | Server port |
 | BASE_URL | (auto-detect) | External URL, e.g. `https://my-server.com` — used for manifest transport URL behind reverse proxy |
-| TRANSLATE_PROVIDER | (empty) | Default provider: `google` \| `deepl` \| `openai` \| `anthropic`. Overridden by per-user config. |
+| TRANSLATE_PROVIDER | (empty) | Default provider: `google` \| `deepl` \| `libretranslate` \| `ollama` \| `openai` \| `anthropic` \| `gemini` \| `mistral` \| `xai` \| `openrouter` \| `bing` \| `yandex`. Overridden by per-user config. |
 | TRANSLATE_KEY | (empty) | Generic API key fallback. Overridden by per-user config. |
 | TRANSLATE_GOOGLE_KEY | (empty) | Provider-specific fallback for Google. |
 | TRANSLATE_DEEPL_KEY | (empty) | Provider-specific fallback for DeepL. |

@@ -32,22 +32,10 @@ import {
   getCachedTranslation, setCachedTranslation, CachedTranslation,
 } from './translate-cache.js';
 
-export interface BuiltinSource {
-  /**
-   * Pre-extracted text sub entries from a video file. When provided, the
-   * pipeline uses this as the translation source — preferred over upstream
-   * subs because the track timing matches the video 100%.
-   */
-  entries: SubtitleEntry[];
-  /** Source language (raw ffprobe tag like "eng", "vie", or ISO 639-1). */
-  lang: string;
-  /** For logging + cache key disambiguation. */
-  videoUrl: string;
-  streamIndex: number;
-}
-
 export interface LingarrPipelineInput {
-  /** Upstream sub list (after dedupe + format detect). */
+  /** Upstream sub list (after dedupe + format detect). The pipeline
+   *  picks the best-language sub (English first) from this list and
+   *  translates it into each requested target language. */
   subs: LingarrSourceSub[];
   /** Effective config (already-decoded from manifest URL). */
   config: AddonConfig;
@@ -62,16 +50,6 @@ export interface LingarrPipelineInput {
    * Injectable for tests. Defaults to the configured provider's translate().
    */
   translate?: (req: ProviderRequest) => Promise<TranslateResult>;
-  /**
-   * Injectable for tests. Defaults to fetchText.
-   */
-  fetchSubContent?: typeof fetchText;
-  /**
-   * Pre-extracted built-in text sub. When set, used as the translation
-   * source in preference to anything in `subs`. Bypasses upstream
-   * download + parse; saves 1 round-trip per target language.
-   */
-  builtinSource?: BuiltinSource;
 }
 
 export interface LingarrSourceSub {
@@ -202,7 +180,6 @@ export async function runLingarrPipeline(
     { apiKey: apiKey ?? '', baseUrl, model, timeoutMs: input.perCallTimeoutMs ?? PER_CALL_TIMEOUT_DEFAULT },
     req,
   ));
-  const fetchSubContent = input.fetchSubContent ?? fetchText;
 
   console.log(`[translate] using provider: ${providerName}`);
 
@@ -216,41 +193,25 @@ export async function runLingarrPipeline(
     return { subs: input.subs, translated: false, log };
   }
 
-  // Resolve translation source: built-in track wins over upstream subs.
-  const builtinSource = input.builtinSource;
-  const sourceEntries = builtinSource?.entries;
-
-  const sourceLang = builtinSource
-    ? normalizeLangForPipeline(builtinSource.lang)
-    : (() => {
-        const up = pickBestSource(input.subs);
-        return up ? (up.normLang ?? '').toLowerCase() : '';
-      })();
-
-  const sourceCacheKey = builtinSource
-    ? `builtin:${builtinSource.videoUrl}|${builtinSource.streamIndex}`
-    : (() => {
-        const up = pickBestSource(input.subs);
-        return up ? resolveRealUrl(up.url) : '';
-      })();
-
+  // Pick the best upstream sub as translation source. Prefer English,
+  // fall back to first available.
+  const sourceSub = pickBestSource(input.subs);
+  if (!sourceSub) {
+    for (const t of missingTargets) {
+      log.push({ target: t, source: '', status: 'no-source' });
+    }
+    return { subs: input.subs, translated: false, log };
+  }
+  const sourceLang = normalizeLangForPipeline(
+    (sourceSub.normLang ?? sourceSub.lang ?? '').trim(),
+  );
+  const sourceCacheKey = resolveRealUrl(sourceSub.url);
   if (!sourceLang || !sourceCacheKey) {
     for (const t of missingTargets) {
       log.push({ target: t, source: sourceLang, status: 'no-source' });
     }
     return { subs: input.subs, translated: false, log };
   }
-
-  const sourceSub: LingarrSourceSub = builtinSource
-    ? {
-        id: `builtin-${builtinSource.streamIndex}`,
-        url: sourceCacheKey,
-        lang: sourceLang,
-        format: 'srt',
-        normLang: sourceLang,
-        entries: builtinSource.entries,
-      }
-    : pickBestSource(input.subs)!;
 
   const newSubs: LingarrSourceSub[] = [];
   let translatedAny = false;
@@ -266,32 +227,24 @@ export async function runLingarrPipeline(
       continue;
     }
 
-    // 2. Built-in: entries already in hand. Upstream: download + parse.
-    let entries: SubtitleEntry[];
-    let fmt: SubtitleFormat;
-    if (builtinSource) {
-      entries = builtinSource.entries;
-      fmt = 'srt';
-    } else {
-      const subContent = await fetchSubContent(sourceCacheKey);
-      if (!subContent) {
-        log.push({ target, source: sourceLang, status: 'failed', detail: 'source fetch failed' });
-        continue;
-      }
-      fmt = sourceSub.format ?? 'srt';
-      const parsed = parseSubtitle(subContent, fmt);
-      if (parsed.length === 0) {
-        log.push({ target, source: sourceLang, status: 'failed', detail: 'source parse empty' });
-        continue;
-      }
-      entries = parsed;
+    // 2. Download + parse the source sub (upstream URL).
+    const subContent = await fetchText(sourceCacheKey);
+    if (!subContent) {
+      log.push({ target, source: sourceLang, status: 'failed', detail: 'source fetch failed' });
+      continue;
+    }
+    const fmt: SubtitleFormat = sourceSub.format ?? 'srt';
+    const parsed = parseSubtitle(subContent, fmt);
+    if (parsed.length === 0) {
+      log.push({ target, source: sourceLang, status: 'failed', detail: 'source parse empty' });
+      continue;
     }
 
     // 3. Build request and translate
     const req: ProviderRequest = {
       sourceLanguage: sourceLang,
       targetLanguage: target,
-      lines: entries,
+      lines: parsed,
     };
     const result = await translate(req);
     if (!result.ok || result.lines.size === 0) {
@@ -303,7 +256,7 @@ export async function runLingarrPipeline(
     }
 
     // 4. Stitch translated lines onto source timestamps
-    const translatedEntries = stitchEntries(entries, result.lines);
+    const translatedEntries = stitchEntries(parsed, result.lines);
     setCachedTranslation(
       providerName,
       sourceCacheKey,

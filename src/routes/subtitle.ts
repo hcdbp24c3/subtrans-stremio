@@ -8,15 +8,11 @@ import {
   calculateOffsetSmart, adjustEntries,
   isFfsubsyncAvailable,
   probeVideoInfoAsync, SmartOffsetResult, VideoProbeResult,
-  extractBuiltinSubtitle,
 } from '../lib/aligner.js';
 import { detectFileExt } from './subtitle-ext.js';
 import { createTtlStore } from '../lib/ttl-store.js';
 import { resolveRealUrl } from '../lib/proxy-resolve.js';
 import { runLingarrPipeline, LingarrSourceSub } from '../lib/translate-pipeline.js';
-import {
-  getCachedBuiltinSub, setCachedBuiltinSub,
-} from '../lib/builtin-sub-cache.js';
 
 const router = Router();
 
@@ -334,90 +330,13 @@ async function subtitlesHandler(req: Request, res: Response) {
 
   console.log(`[subtitle] Fetched ${allSubs.length} subs from ${config.subUrls.length} addon(s)`);
 
-  // Built-in sub fallback: when upstream returns nothing, try to use a text
-  // track extracted from the video itself as the translation source. This
-  // makes Lingarr usable for users who have NO sub addon installed — they
-  // only need a video with a text sub track.
-  let builtinSource: { entries: SubtitleEntry[]; lang: string; videoUrl: string; streamIndex: number } | null = null;
-  if (allSubs.length === 0 && videoUrl && videoProbe && videoProbe.subtitleStreams.length > 0) {
-    const vidUrl = videoUrl; // narrow for inner closures
-    const best = videoProbe.subtitleStreams.find(
-      (s) => s.lang.startsWith('eng') || s.lang === 'en',
-    ) ?? videoProbe.subtitleStreams[0];
-
-    const cached = getCachedBuiltinSub(vidUrl, best.index);
-    if (cached) {
-      console.log(`[translate] builtin sub cache hit: track ${best.index} (${cached.lang}, ${cached.entries.length} entries)`);
-      builtinSource = {
-        entries: cached.entries,
-        lang: cached.lang,
-        videoUrl: vidUrl,
-        streamIndex: best.index,
-      };
-    } else {
-      // Try a quick foreground extract (32 MB window) so the first request
-      // has a chance of returning subs on a healthy CDN. If the cluster
-      // sits past that window, the route falls back to a background
-      // extract (this same call returns null) and the next /subtitles
-      // request will hit the warmed cache. User has to play, exit, and
-      // re-enter once.
-      const willTranslate = config.translateTargets.length > 0;
-      const remaining = budgetLeftMs();
-      if (willTranslate && remaining > 4_000) {
-        console.log(`[translate] builtin sub cache miss: foreground extract for track ${best.index} (${remaining}ms left)`);
-        const extractBudget = Math.max(4, Math.min(12, (remaining - 2_000) / 1000));
-        const srt = await extractBuiltinSubtitle(vidUrl, best.index, extractBudget);
-        if (srt) {
-          const entries = parseSubtitle(srt, 'srt');
-          if (entries.length > 0) {
-            setCachedBuiltinSub(vidUrl, best.index, {
-              entries, format: 'srt', lang: best.lang,
-              streamIndex: best.index, extractedAt: Date.now(),
-            });
-            console.log(`[translate] foreground extract: cached ${entries.length} entries from track ${best.index} (${best.lang})`);
-            builtinSource = {
-              entries, lang: best.lang,
-              videoUrl: vidUrl, streamIndex: best.index,
-            };
-          } else {
-            console.log(`[translate] foreground extract: empty parse for track ${best.index}`);
-          }
-        } else {
-          console.log(`[translate] foreground extract: no content for track ${best.index} — route will background-extract`);
-        }
-      } else {
-        console.log(`[translate] builtin sub cache miss: scheduling background extract for track ${best.index}`);
-        void extractBuiltinSubtitle(vidUrl, best.index, 30)
-          .then(async (srt) => {
-            if (!srt) {
-              console.log(`[translate] background extract: no content for track ${best.index}`);
-              return;
-            }
-            const entries = parseSubtitle(srt, 'srt');
-            if (entries.length === 0) {
-              console.log(`[translate] background extract: empty parse for track ${best.index}`);
-              return;
-            }
-            setCachedBuiltinSub(vidUrl, best.index, {
-              entries, format: 'srt', lang: best.lang,
-              streamIndex: best.index, extractedAt: Date.now(),
-            });
-            console.log(`[translate] background extract: cached ${entries.length} entries from track ${best.index} (${best.lang})`);
-          })
-          .catch((e: unknown) => {
-            const msg = e instanceof Error ? e.message : String(e);
-            console.log(`[translate] background extract error: ${msg.substring(0, 200)}`);
-          });
-      }
-    }
-  }
-
-  if (allSubs.length === 0 && !builtinSource) {
+  if (allSubs.length === 0) {
+    console.log(`[subtitle] No upstream subs; configure a sub addon (OpenSubtitles, Stremio Community Subs, etc.) for translation`);
     res.json({ subtitles: [] });
     return;
   }
 
-  // 4. Filter + limit (only meaningful for upstream subs)
+  // 4. Filter + limit
   allSubs = filterByLanguage(allSubs, config.languages);
   allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
   const beforeDedupe = allSubs.length;
@@ -432,12 +351,9 @@ async function subtitlesHandler(req: Request, res: Response) {
     _format: detectFormat(sub.url) || undefined,
   })) as Subtitle[];
 
-  // 5.5. Lingarr translation: fill missing target langs by translating the best
-  //      source sub. Runs only if Lingarr is configured AND the budget allows.
-  //      Translated subs are returned with pre-built `_entries`; the URL
-  //      rewrite step below serves them via the existing /alignedsub endpoint.
-  //      Built-in source (from background-extracted cache) takes priority over
-  //      upstream subs when both are available.
+  // 5.5. Translate the best upstream sub (typically English) into each
+  //      requested target language. Source = upstream sub URL (NOT a video
+  //      track) — requires a working upstream sub addon in the config.
   if (config.translateTargets.length === 0) {
     console.log(`[translate] skip: no translateTargets configured`);
   } else if (budgetLeftMs() < 4_000) {
@@ -450,12 +366,11 @@ async function subtitlesHandler(req: Request, res: Response) {
       format: s._format,
       normLang: s.lang ? normalizeLang(s.lang) : '',
     }));
-    console.log(`[translate] running: targets=[${config.translateTargets.join(',')}] builtinSource=${builtinSource ? 'yes' : 'no'} budgetMs=${budgetLeftMs()}`);
+    console.log(`[translate] running: targets=[${config.translateTargets.join(',')}] sourceSubs=${translateInput.length} budgetMs=${budgetLeftMs()}`);
     const translateOut = await runLingarrPipeline({
       subs: translateInput,
       config,
       budgetMs: budgetLeftMs(),
-      builtinSource: builtinSource ?? undefined,
     });
     if (translateOut.translated) {
       const newSubs: Subtitle[] = translateOut.subs
@@ -468,7 +383,6 @@ async function subtitlesHandler(req: Request, res: Response) {
           _entries: s.entries,
         }));
       allSubs = [...allSubs, ...newSubs];
-      // Re-apply per-language cap so translation doesn't push out upstream subs
       allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
       const translatedCount = newSubs.length;
       const cacheHitCount = translateOut.log.filter((l) => l.status === 'cache-hit').length;
@@ -478,7 +392,6 @@ async function subtitlesHandler(req: Request, res: Response) {
         console.log(`[translate] ${entry.target} ← ${entry.source || '?'} ${entry.status}${entry.detail ? ` (${entry.detail})` : ''}`);
       }
     } else if (translateOut.log.length > 0) {
-      // Pipeline ran but produced nothing — surface why
       console.log(`[translate] no translation: ${translateOut.log.length} log entries`);
       for (const entry of translateOut.log) {
         console.log(`[translate] ${entry.target} ← ${entry.source || '?'} ${entry.status}${entry.detail ? ` (${entry.detail})` : ''}`);

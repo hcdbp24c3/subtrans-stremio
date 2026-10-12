@@ -231,155 +231,6 @@ export function listSubtitleStreams(videoUrl: string): SubtitleStreamInfo[] {
   } catch { return []; }
 }
 
-/**
- * Find the best text-based subtitle stream for alignment reference.
- * Prefers English, then falls back to first available.
- */
-export function findBestRefSubtitleStream(videoUrl: string): SubtitleStreamInfo | null {
-  const streams = listSubtitleStreams(videoUrl);
-  if (streams.length === 0) return null;
-  console.log(`[aligner] Found ${streams.length} text subtitle streams: ${streams.map(s => `${s.index}:${s.lang}`).join(', ')}`);
-  const engStream = streams.find(s => s.lang.startsWith('eng') || s.lang === 'en');
-  if (engStream) { console.log(`[aligner] Selected English ref stream: ${engStream.index}`); return engStream; }
-  console.log(`[aligner] No English stream, using first: ${streams[0].index}`);
-  return streams[0];
-}
-
-/**
- * Extract a subtitle track from a video URL as SRT content.
- * Uses timeout — for large files, partial extraction is OK for alignment.
- */
-/**
- * Locate the first packet of a specific sub track via ffprobe. Returns
- * the byte offset in the file, or null if not found.
- */
-function probeFirstPacketPos(videoUrl: string, streamIndex: number, timeoutMs: number): number | null {
-  // Use -read_intervals %+#500 to only scan first 500 MB. For a 30-80 GB
-  // torrent, the sub track's first cluster is usually within 500 MB; if
-  // it's later we'll fall back to scanning the whole file (slower).
-  // -select_streams <n> limits to the target sub only, dramatically
-  // reducing output size + scan time.
-  try {
-    const out = execSync(
-      `ffprobe -v error -read_intervals '%+#500' -select_streams ${streamIndex} -show_entries packet=stream_index,pos -of csv=p=0 "${videoUrl}" 2>/dev/null | head -1`,
-      { encoding: 'utf-8', timeout: timeoutMs },
-    ).trim();
-    if (!out) return null;
-    const parts = out.split(',');
-    if (parts.length < 2) return null;
-    const idx = parseInt(parts[0], 10);
-    const pos = parseInt(parts[1], 10);
-    if (idx !== streamIndex || isNaN(pos) || pos <= 0) return null;
-    return pos;
-  } catch {
-    return null;
-  }
-}
-
-export async function extractBuiltinSubtitle(
-  videoUrl: string,
-  streamIndex: number,
-  timeoutSec = 30,
-): Promise<string | null> {
-  const tmpFile = join(tmpdir(), `builtin_sub_${streamIndex}_${Date.now()}.srt`);
-  const stderrFile = join(tmpdir(), `builtin_sub_${streamIndex}_${Date.now()}.err`);
-  const partialFile = join(tmpdir(), `builtin_video_${streamIndex}_${Date.now()}.mkv`);
-  // Escape the URL for shell — torrentio URLs contain '&', '?', etc. that
-  // would be interpreted as shell metacharacters without quoting.
-  const safeUrl = videoUrl.replace(/(["'$`\\])/g, '\\$1');
-
-  try {
-    // For built-in sub from a 30-80 GB torrent, the sub cluster may sit
-    // hundreds of MB past the first packet and we can't always locate
-    // it in a reasonable download window. The route falls back to a
-    // background full extract (up to 30s) when this fails; the next
-    // /subtitles request hits the warmed cache. So here we attempt
-    // foreground but don't burn too much time on it.
-    if (timeoutSec < 4) {
-      return null; // route would skip anyway
-    }
-    const probeBudget = 8; // seconds; ffprobe scan over a 30 GB file is ~5-8s
-    const firstPos = probeFirstPacketPos(safeUrl, streamIndex, probeBudget * 1000);
-    if (firstPos === null) {
-      console.log(`[aligner] probe: no sub packets found for track ${streamIndex}; route will background-extract`);
-      return null;
-    }
-    console.log(`[aligner] probe: track ${streamIndex} first packet at byte ${firstPos}`);
-
-    // Best-effort foreground extract: 1 GB window from byte 0. mkvextract
-    // (replacing the previous ffmpeg) can extract sub tracks from a partial
-    // file as long as the partial file has the EBML header + the
-    // sub track's cluster data. For 30-80 GB REMUXes, 1 GB usually
-    // covers the sub cluster for the first dialogue cue.
-    const WINDOW = 1024 * 1024 * 1024; // 1 GB
-    const rangeStart = 0;
-    const rangeEnd = WINDOW - 1;
-    const curlBudget = Math.max(20, Math.min(45, timeoutSec - 5));
-    const curlCmd =
-      `timeout ${curlBudget} curl -sSL ` +
-      `-A "Mozilla/5.0" ` +
-      `-H "Range: bytes=${rangeStart}-${rangeEnd}" ` +
-      `--max-time ${curlBudget - 1} ` +
-      `-o "${partialFile}" ` +
-      `"${safeUrl}" 2>"${stderrFile}"`;
-    console.log(`[aligner] foreground: trying ${WINDOW / 1024 / 1024 / 1024} GB window (${curlBudget}s budget)...`);
-    await execAsync(curlCmd, (curlBudget + 5) * 1000);
-
-    if (!existsSync(partialFile) || statSync(partialFile).size < 1000) {
-      console.log(`[aligner] foreground: download too small, route will background-extract`);
-      return null;
-    }
-
-    // Try to extract from the local partial file. mkvextract is ~5x
-    // faster than ffmpeg for the same job and handles partial files
-    // more robustly (strict EBML parser).
-    const mkvTimeout = 8;
-    const mkvCmd =
-      `timeout ${mkvTimeout} mkvextract tracks "${partialFile}" ${streamIndex}:"${tmpFile}" 2>>"${stderrFile}"`;
-    await execAsync(mkvCmd, (mkvTimeout + 2) * 1000);
-
-    if (existsSync(tmpFile)) {
-      const content = readFileSync(tmpFile, 'utf-8');
-      try { unlinkSync(tmpFile); } catch {}
-      if (content.trim().length > 0) {
-        const entryCount = countSrtEntries(content);
-        console.log(`[aligner] foreground extracted: ${content.length} bytes, ${entryCount} entries`);
-        return content;
-      }
-    }
-    if (existsSync(stderrFile)) {
-      const err = readFileSync(stderrFile, 'utf-8');
-      const tail = err.trim().split('\n').slice(-2).join(' | ');
-      console.log(`[aligner] foreground: mkvextract got no sub content; route will background-extract. stderr: ${tail}`);
-    }
-    return null;
-  } catch (e: any) {
-    if (existsSync(tmpFile)) {
-      try {
-        const content = readFileSync(tmpFile, 'utf-8');
-        try { unlinkSync(tmpFile); } catch {}
-        if (content.trim().length > 100) {
-          console.log(`[aligner] Recovered partial builtin sub: ${content.length} bytes, ${countSrtEntries(content)} entries`);
-          return content;
-        }
-      } catch {}
-    }
-    let errTail = '';
-    if (existsSync(stderrFile)) {
-      try {
-        const err = readFileSync(stderrFile, 'utf-8');
-        errTail = err.trim().split('\n').slice(-3).join(' | ');
-      } catch {}
-    }
-    console.log(`[aligner] Builtin sub extraction failed: ${e.message?.substring(0, 100)} | stderr: ${errTail || '(empty)'}`);
-    return null;
-  } finally {
-    for (const f of [tmpFile, partialFile, stderrFile]) {
-      try { unlinkSync(f); } catch {}
-    }
-  }
-}
-
 // ── ffsubsync wrapper (Python library bridge) ─────────────────────
 
 /** Absolute path to the Python bridge (ships next to this file in dist/ or src/). */
@@ -570,27 +421,11 @@ export async function calculateOffsetSmart(
   targetSubContent: string,
   textStreams: SubtitleStreamInfo[] = [],
 ): Promise<SmartOffsetResult> {
-  // 1) Builtin text subtitle reference (fastest reliable path)
-  const eng = textStreams.find((s) => s.lang.startsWith('eng') || s.lang === 'en')
-    ?? textStreams[0];
-  if (eng) {
-    const refSrt = await extractBuiltinSubtitle(videoUrl, eng.index, 30);
-    if (refSrt && countSrtEntries(refSrt) >= 3) {
-      const refPath = writeTempSrt(refSrt, `ref_${eng.index}`);
-      try {
-        const result = await runFfsubsyncLocal(refPath, targetSubContent, `builtin-sub#${eng.index}`);
-        if (result.ok) return { offset: result.offset, method: 'builtin-sub', completed: true };
-      } finally {
-        try { unlinkSync(refPath); } catch {}
-      }
-    }
-  }
-
-  // 2) Library video path with --fast (extract-audio-first, bounded)
+  // 1) Library video path with --fast (extract-audio-first, bounded)
   const videoResult = await calculateOffsetWithFfsubsyncVideo(videoUrl, targetSubContent);
   if (videoResult.ok) return { offset: videoResult.offset, method: 'video-remote', completed: true };
 
-  // 3) Local audio sample + library sub-to-sub (works for PGS-only remuxes)
+  // 2) Local audio sample + library sub-to-sub (works for PGS-only remuxes)
   const wavPath = await extractAudioSample(videoUrl, 180, 45);
   if (wavPath) {
     try {
