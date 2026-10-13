@@ -324,25 +324,30 @@ async function subtitlesHandler(req: Request, res: Response) {
   // Wait for subs to complete (probe already awaited above)
   const subResults = await subPromise;
 
-  let allSubs: Subtitle[] = subResults
+  const sourceSubs: Subtitle[] = subResults
     .filter((r) => r.status === 'fulfilled')
     .flatMap((r) => (r as PromiseFulfilledResult<Subtitle[]>).value);
 
-  console.log(`[subtitle] Fetched ${allSubs.length} subs from ${config.subUrls.length} addon(s)`);
+  console.log(`[subtitle] Fetched ${sourceSubs.length} subs from ${config.subUrls.length} addon(s)`);
 
-  if (allSubs.length === 0) {
+  if (sourceSubs.length === 0) {
     console.log(`[subtitle] No upstream subs; configure a sub addon (OpenSubtitles, Stremio Community Subs, etc.) for translation`);
     res.json({ subtitles: [] });
     return;
   }
 
-  // 4. Filter + limit
-  allSubs = filterByLanguage(allSubs, config.languages);
+  // Translation pipeline needs the unfiltered source list (e.g. English subs
+  // to translate into vi/ja). Apply the `languages` filter to the display
+  // list only, after we've captured sourceSubs.
+  let allSubs: Subtitle[] = filterByLanguage(sourceSubs, config.languages);
   allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
   const beforeDedupe = allSubs.length;
   allSubs = dedupeSubtitles(allSubs);
   if (allSubs.length !== beforeDedupe) {
     console.log(`[subtitle] Deduped ${beforeDedupe - allSubs.length} duplicate URL(s)`);
+  }
+  if (sourceSubs.length !== allSubs.length) {
+    console.log(`[subtitle] Display filter: ${allSubs.length}/${sourceSubs.length} subs (languages="${config.languages || '*'}")`);
   }
 
   // 5. Detect format for alignment (BEFORE URL rewrite — all URLs are still original upstream URLs)
@@ -354,12 +359,14 @@ async function subtitlesHandler(req: Request, res: Response) {
   // 5.5. Translate the best upstream sub (typically English) into each
   //      requested target language. Source = upstream sub URL (NOT a video
   //      track) — requires a working upstream sub addon in the config.
+  //      Use the unfiltered sourceSubs list so the pipeline can pick an
+  //      English source even when the user's display filter is narrow.
   if (config.translateTargets.length === 0) {
     console.log(`[translate] skip: no translateTargets configured`);
   } else if (budgetLeftMs() < 4_000) {
     console.log(`[translate] skip: budget low (${budgetLeftMs()}ms < 4000ms)`);
   } else {
-    const translateInput: LingarrSourceSub[] = allSubs.map((s) => ({
+    const translateInput: LingarrSourceSub[] = sourceSubs.map((s) => ({
       id: s.id,
       url: s.url,
       lang: s.lang,
