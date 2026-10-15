@@ -405,24 +405,22 @@ async function subtitlesHandler(req: Request, res: Response) {
   // null on failure/timeout). Runs in parallel with translate so the total
   // request fits in budget.
   let alignPromise: Promise<{ offset: number; completed: boolean; method?: string } | null> = Promise.resolve(null);
-  let bestAlignSub: Subtitle | null = null;
-  if (canAlign) {
-    // Pick the best English source for ffsubsync. Prefer English lang, then
-    // first source subs. Translated subs (with `lingarr://` URL) are skipped.
-    const englishCandidate = sourceWithFormat.find((s) => {
-      const l = (s.lang || '').toLowerCase();
-      return l === 'en' || l === 'eng';
-    });
-    bestAlignSub = englishCandidate || sourceWithFormat[0] || null;
-  }
-  if (bestAlignSub) {
-    const alignSub = bestAlignSub;
+  const willAlign = canAlign && sourceWithFormat.length > 0;
+  if (willAlign) {
     alignPromise = (async () => {
       // 1. Try fast engine (release-name, sub-consensus, minimal-vad).
       //    These are free or <2s and cover most real-world cases.
       const probe = await probePromise;
       const videoDuration = probe?.duration ?? null;
       const fastBudget = Math.max(2_000, budgetLeftMs() - 8_000);
+      // Diagnostic: log what fast-align saw
+      const releaseNames = sourceWithFormat.slice(0, 5).map((s) => ({
+        id: s.id,
+        lang: s.lang || '',
+        url: (s.url || '').slice(-80),
+        release: s._releaseName || '',
+      }));
+      console.log(`[subtitle] fast-align: video="${videoFilename}", sourceSubs=${sourceWithFormat.length}, samples=${JSON.stringify(releaseNames)}`);
       const fast = await calculateOffsetFast(
         videoUrl!,
         videoFilename,
@@ -440,35 +438,49 @@ async function subtitlesHandler(req: Request, res: Response) {
       }
       console.log(`[subtitle] fast-align: not confident${fast ? ` (best=${fast.method}@${fast.score.toFixed(2)})` : ''}, escalating to ffsubsync`);
 
-      // 2. Fall back to ffsubsync (slow but reliable).
-      const realUrl = resolveRealUrl(alignSub.url);
-      console.log(`[subtitle] ffsubsync: syncing best sub against video audio...`);
-      const subContent = await fetchText(realUrl);
-      if (!subContent) {
-        console.log(`[subtitle] ffsubsync: could not fetch source sub`);
-        return null;
-      }
-      const fmt = (alignSub._format || 'srt') as SubtitleFormat;
-      let analysisSrt = subContent;
-      if (fmt !== 'srt') {
-        const entries = parseSubtitle(subContent, fmt);
-        if (entries.length > 0) analysisSrt = reSerialize(entries, 'srt') || subContent;
-      }
-      const align = await calculateOffsetSmart(
-        videoUrl!,
-        analysisSrt,
-        probe?.subtitleStreams ?? [],
-      );
-      if (align.completed) {
-        setOffsetCache(videoUrl!, align.offset);
-        console.log(
-          `[subtitle] ffsubsync: offset=${align.offset.toFixed(3)}s via ${align.method}` +
-          (align.offset === 0 ? ' (already synced)' : ''),
+      // 2. Fall back to ffsubsync (slow but reliable). Try the best
+      //    English sub first, then up to 3 more English subs in case
+      //    the first URL is dead (CDN/auth/redirect issues).
+      const englishSubs = sourceWithFormat
+        .filter((s) => {
+          const l = (s.lang || '').toLowerCase();
+          return l === 'en' || l === 'eng';
+        })
+        .slice(0, 4);
+      const candidates = englishSubs.length > 0 ? englishSubs : sourceWithFormat.slice(0, 4);
+      for (const candidate of candidates) {
+        const realUrl = resolveRealUrl(candidate.url);
+        console.log(`[subtitle] ffsubsync: trying ${candidate.id} (url=${realUrl.slice(-60)})`);
+        const subContent = await fetchText(realUrl);
+        if (!subContent) {
+          console.log(`[subtitle] ffsubsync: could not fetch ${candidate.id}, trying next`);
+          continue;
+        }
+        const fmt = (candidate._format || 'srt') as SubtitleFormat;
+        let analysisSrt = subContent;
+        if (fmt !== 'srt') {
+          const entries = parseSubtitle(subContent, fmt);
+          if (entries.length > 0) analysisSrt = reSerialize(entries, 'srt') || subContent;
+        }
+        console.log(`[subtitle] ffsubsync: syncing ${candidate.id} (${analysisSrt.length}B) against video audio...`);
+        const align = await calculateOffsetSmart(
+          videoUrl!,
+          analysisSrt,
+          probe?.subtitleStreams ?? [],
         );
-      } else {
-        console.log(`[subtitle] ffsubsync: no definitive offset via ${align.method || 'cascade'}`);
+        if (align.completed) {
+          setOffsetCache(videoUrl!, align.offset);
+          console.log(
+            `[subtitle] ffsubsync: offset=${align.offset.toFixed(3)}s via ${align.method}` +
+            (align.offset === 0 ? ' (already synced)' : ''),
+          );
+        } else {
+          console.log(`[subtitle] ffsubsync: no definitive offset via ${align.method || 'cascade'}`);
+        }
+        return { offset: align.offset, completed: align.completed, method: align.method };
       }
-      return { offset: align.offset, completed: align.completed, method: align.method };
+      console.log(`[subtitle] ffsubsync: all ${candidates.length} candidates failed to fetch`);
+      return null;
     })().catch((e: any) => {
       console.log(`[subtitle] align: error: ${e?.message?.substring(0, 200)}`);
       return null;
@@ -540,7 +552,7 @@ async function subtitlesHandler(req: Request, res: Response) {
   // built-in subs; ~10-20s with audio extraction.
   let listCacheable = true;
   const remainingForAlign = budgetLeftMs() - RESPONSE_MARGIN_MS;
-  if (bestAlignSub && remainingForAlign > 0) {
+  if (willAlign && remainingForAlign > 0) {
     if (remainingForAlign < MIN_ALIGN_WAIT_MS) {
       console.log(`[subtitle] time budget low for align — letting it finish in background, serving with offset=${offset}`);
       alignPromise.catch(() => {}); // fire-and-forget warm
@@ -560,7 +572,7 @@ async function subtitlesHandler(req: Request, res: Response) {
         if (!alignResult.completed) listCacheable = false;
       }
     }
-  } else if (bestAlignSub) {
+  } else if (willAlign) {
     listCacheable = false;
   }
 
