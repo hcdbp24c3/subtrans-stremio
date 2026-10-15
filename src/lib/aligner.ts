@@ -415,18 +415,27 @@ export async function extractBuiltInSubAsSrt(
   timeoutSec = 12,
 ): Promise<string | null> {
   const outFile = join(tmpdir(), `builtin_sub_${Date.now()}.srt`);
-  const cmd = `timeout ${timeoutSec} ffmpeg -y -i "${videoUrl}" -map 0:s:${streamIndex} -c:s text -f srt "${outFile}" 2>/dev/null`;
+  // Try codec copy first (works for subrip/mov_text/webvtt in-place). If
+  // ffmpeg rejects (PGS/ASS need transcode), the output file is missing or
+  // empty and we fall through to null.
+  const cmd = `timeout ${timeoutSec} ffmpeg -y -i "${videoUrl}" -map 0:s:${streamIndex} -c:s copy -f srt "${outFile}" 2>/dev/null`;
   try {
     await execAsync(cmd, (timeoutSec + 3) * 1000);
   } catch {
     // timeout(1) exit 124 — file may still be partial
   }
-  if (!existsSync(outFile)) return null;
-  const content = readFileSync(outFile, 'utf-8');
+  if (!existsSync(outFile)) {
+    console.log(`[aligner] builtin sub s:${streamIndex}: no output file (likely PGS or HTTP scan fail)`);
+    return null;
+  }
+  let content: string;
+  try { content = readFileSync(outFile, 'utf-8'); } catch { return null; }
   try { unlinkSync(outFile); } catch {}
-  if (content.trim().length === 0) return null;
-  // Quick sanity: SRT has at least one arrow
-  if (!content.includes('-->')) return null;
+  if (content.trim().length === 0 || !content.includes('-->')) {
+    console.log(`[aligner] builtin sub s:${streamIndex}: extracted ${content.length}B but no SRT markers`);
+    return null;
+  }
+  console.log(`[aligner] builtin sub s:${streamIndex}: extracted ${content.length}B of SRT`);
   return content;
 }
 
@@ -453,10 +462,12 @@ export async function calculateOffsetSmart(
   targetSubContent: string,
   textStreams: SubtitleStreamInfo[] = [],
 ): Promise<SmartOffsetResult> {
-  // 1) Builtin text sub sync (fastest when video has text subs). Try up to
-  //    3 streams in parallel — usually only the first English stream
-  //    matches, but other langs may help if English isn't in upstream.
-  if (textStreams.length > 0) {
+  // 1) Builtin text sub sync (fastest when video has text subs and we can
+  //    reach them cheaply). Skip over HTTP(S) URLs — ffmpeg has to download
+  //    a chunk of the file to scan sub streams, which costs ~30s for large
+  //    REMUXes and usually fails before producing output.
+  const isHttp = /^https?:\/\//i.test(videoUrl);
+  if (textStreams.length > 0 && !isHttp) {
     const builtinCandidates = textStreams.slice(0, 3);
     const builtinResult = await Promise.race([
       (async () => {

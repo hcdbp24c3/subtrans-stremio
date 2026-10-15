@@ -24,10 +24,11 @@ const subDownloadCache = createTtlStore<{ body: Buffer; contentType: string }>(1
 const alignedSubCache = createTtlStore<{ body: Buffer; contentType: string }>(100);
 const ALIGNED_SUB_TTL_MS = 30 * 60 * 1000; // ≥ subtitle list cache TTL
 
-// Nuvio client aborts each addon after 20s; Stremio web ~30s. Use 18s to
-// leave a 2s margin while still fitting probe + audio extract + ffsubsync
-// + translate + apply in a single request.
-export const HANDLER_BUDGET_MS = 18_000;
+// Nuvio client aborts each addon after 30s; Stremio web ~60s. Use 25s to
+// leave a 5s margin while still fitting probe + audio extract + ffsubsync
+// + translate + apply in a single request. Translation of N target langs
+// adds at most a few seconds; ffsubsync cascade is the longest pole.
+export const HANDLER_BUDGET_MS = 25_000;
 const RESPONSE_MARGIN_MS = 2_000;
 const MIN_ALIGN_WAIT_MS = 3_000;   // don't bother racing alignment under this
 const MIN_APPLY_MS = 4_000;        // need time to re-download + adjust subs
