@@ -9,6 +9,7 @@ import {
   isFfsubsyncAvailable,
   probeVideoInfoAsync, SmartOffsetResult, VideoProbeResult,
 } from '../lib/aligner.js';
+import { calculateOffsetFast, FastOffsetResult } from '../lib/align-fast.js';
 import { detectFileExt } from './subtitle-ext.js';
 import { createTtlStore } from '../lib/ttl-store.js';
 import { resolveRealUrl } from '../lib/proxy-resolve.js';
@@ -381,6 +382,29 @@ async function subtitlesHandler(req: Request, res: Response) {
   if (bestAlignSub) {
     const alignSub = bestAlignSub;
     alignPromise = (async () => {
+      // 1. Try fast engine (release-name, sub-consensus, minimal-vad).
+      //    These are free or <2s and cover most real-world cases.
+      const probe = await probePromise;
+      const videoDuration = probe?.duration ?? null;
+      const fastBudget = Math.max(2_000, budgetLeftMs() - 8_000);
+      const fast = await calculateOffsetFast(
+        videoUrl!,
+        videoFilename,
+        videoDuration,
+        sourceWithFormat,
+        fastBudget,
+      );
+      if (fast && fast.score >= 0.5) {
+        setOffsetCache(videoUrl!, fast.offset);
+        console.log(
+          `[subtitle] fast-align: offset=${fast.offset.toFixed(3)}s via ${fast.method}` +
+          (fast.offset === 0 ? ' (already synced)' : ''),
+        );
+        return { offset: fast.offset, completed: true, method: fast.method };
+      }
+      console.log(`[subtitle] fast-align: not confident${fast ? ` (best=${fast.method}@${fast.score.toFixed(2)})` : ''}, escalating to ffsubsync`);
+
+      // 2. Fall back to ffsubsync (slow but reliable).
       const realUrl = resolveRealUrl(alignSub.url);
       console.log(`[subtitle] ffsubsync: syncing best sub against video audio...`);
       const subContent = await fetchText(realUrl);
@@ -394,8 +418,6 @@ async function subtitlesHandler(req: Request, res: Response) {
         const entries = parseSubtitle(subContent, fmt);
         if (entries.length > 0) analysisSrt = reSerialize(entries, 'srt') || subContent;
       }
-      // Wait for probe to finish so we can pass text streams to aligner
-      const probe = await probePromise;
       const align = await calculateOffsetSmart(
         videoUrl!,
         analysisSrt,
@@ -412,7 +434,7 @@ async function subtitlesHandler(req: Request, res: Response) {
       }
       return { offset: align.offset, completed: align.completed, method: align.method };
     })().catch((e: any) => {
-      console.log(`[subtitle] ffsubsync: error: ${e?.message?.substring(0, 200)}`);
+      console.log(`[subtitle] align: error: ${e?.message?.substring(0, 200)}`);
       return null;
     });
   }
