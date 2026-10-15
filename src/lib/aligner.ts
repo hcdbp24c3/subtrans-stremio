@@ -9,6 +9,11 @@ const OFFSET_THRESHOLD = 0.5;
 const MAX_OFFSET = 600;
 const TEXT_SIMILARITY_MIN = 0.6;
 
+/** Resolve after the given delay. Used to ceiling sub-cascade steps. */
+function sleep(ms: number): Promise<null> {
+  return new Promise((resolve) => setTimeout(() => resolve(null), Math.max(0, ms)));
+}
+
 /** Run a shell command without blocking the Node event loop. */
 function execAsync(
   cmd: string,
@@ -391,11 +396,38 @@ export async function calculateOffsetWithFfsubsyncVideo(
     return await runFfsubsyncBridge(
       ['video', videoUrl, targetFile, '--fast'],
       'video-fast',
-      60000,
+      15000, // tight timeout — let cascade fall through to audio-sample
     );
   } finally {
     try { unlinkSync(targetFile); } catch {}
   }
+}
+
+/**
+ * Extract one text-based subtitle track from the video as SRT, then sync
+ * the upstream sub against it. Much faster than full-audio VAD for remuxes
+ * that already have text subs (e.g. BluRay REMUX often ships PGS + 1-2 SRT).
+ * Uses `ffmpeg -map 0:s:N` to copy the codec without re-encoding.
+ */
+export async function extractBuiltInSubAsSrt(
+  videoUrl: string,
+  streamIndex: number,
+  timeoutSec = 12,
+): Promise<string | null> {
+  const outFile = join(tmpdir(), `builtin_sub_${Date.now()}.srt`);
+  const cmd = `timeout ${timeoutSec} ffmpeg -y -i "${videoUrl}" -map 0:s:${streamIndex} -c:s text -f srt "${outFile}" 2>/dev/null`;
+  try {
+    await execAsync(cmd, (timeoutSec + 3) * 1000);
+  } catch {
+    // timeout(1) exit 124 — file may still be partial
+  }
+  if (!existsSync(outFile)) return null;
+  const content = readFileSync(outFile, 'utf-8');
+  try { unlinkSync(outFile); } catch {}
+  if (content.trim().length === 0) return null;
+  // Quick sanity: SRT has at least one arrow
+  if (!content.includes('-->')) return null;
+  return content;
 }
 
 export type OffsetMethod = 'builtin-sub' | 'audio-sample' | 'video-remote';
@@ -408,25 +440,52 @@ export interface SmartOffsetResult {
 }
 
 /**
- * Fast offset cascade (benchmarked on 62GB Real-Debrid REMUX):
- *  1. Builtin text sub extract → library sub-to-sub (~30s extract + ~1s sync)
- *  2. Library video --fast (extract-audio-first 60s → ~35s total)
+ * Fast offset cascade (parallel where possible):
+ *  1. Builtin text sub extract → library sub-to-sub (~3-8s typical for remux)
+ *  2. Library video --fast (extract-audio-first 60s → ~10-35s total)
  *  3. Bounded local audio sample → library sub-to-sub (fallback)
  *
- * Does not block the event loop. completed=false means every step failed
- * (do not cache). completed=true with offset=0 means "already synced" (cache).
+ * Each step is bounded; completed=false means every step failed (do not
+ * cache). completed=true with offset=0 means "already synced" (cache).
  */
 export async function calculateOffsetSmart(
   videoUrl: string,
   targetSubContent: string,
   textStreams: SubtitleStreamInfo[] = [],
 ): Promise<SmartOffsetResult> {
-  // 1) Library video path with --fast (extract-audio-first, bounded)
+  // 1) Builtin text sub sync (fastest when video has text subs). Try up to
+  //    3 streams in parallel — usually only the first English stream
+  //    matches, but other langs may help if English isn't in upstream.
+  if (textStreams.length > 0) {
+    const builtinCandidates = textStreams.slice(0, 3);
+    const builtinResult = await Promise.race([
+      (async () => {
+        for (const stream of builtinCandidates) {
+          const refSrt = await extractBuiltInSubAsSrt(videoUrl, stream.index, 8);
+          if (refSrt) {
+            const result = await runFfsubsyncLocal(
+              writeTempSrt(refSrt, 'builtin'),
+              targetSubContent,
+              `builtin-${stream.index}`,
+            );
+            if (result.ok) return { ...result, stream };
+          }
+        }
+        return null;
+      })(),
+      sleep(10000), // hard ceiling: don't spend more than 10s on builtin
+    ]);
+    if (builtinResult && builtinResult !== null && typeof builtinResult === 'object' && 'ok' in builtinResult && builtinResult.ok) {
+      return { offset: builtinResult.offset, method: 'builtin-sub', completed: true };
+    }
+  }
+
+  // 2) Library video path with --fast (15s budget)
   const videoResult = await calculateOffsetWithFfsubsyncVideo(videoUrl, targetSubContent);
   if (videoResult.ok) return { offset: videoResult.offset, method: 'video-remote', completed: true };
 
-  // 2) Local audio sample + library sub-to-sub (works for PGS-only remuxes)
-  const wavPath = await extractAudioSample(videoUrl, 180, 45);
+  // 3) Local audio sample + library sub-to-sub (works for PGS-only remuxes)
+  const wavPath = await extractAudioSample(videoUrl, 180, 30);
   if (wavPath) {
     try {
       const result = await runFfsubsyncLocal(wavPath, targetSubContent, 'audio-sample');
