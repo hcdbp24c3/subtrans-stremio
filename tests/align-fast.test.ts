@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { offsetByReleaseName, extractReleaseEncode } from '../src/lib/align-fast.js';
+import { extractReleaseNameFromUrl } from '../src/routes/subtitle.js';
 
 describe('extractReleaseEncode', () => {
   it('extracts bluray from various spellings', () => {
@@ -39,5 +40,26 @@ describe('offsetByReleaseName', () => {
     expect(offsetByReleaseName(null, SUB_BD)).toBeNull();
     expect(offsetByReleaseName(VIDEO_BD, null)).toBeNull();
     expect(offsetByReleaseName(VIDEO_BD, '')).toBeNull();
+  });
+});
+
+describe('extractReleaseNameFromUrl', () => {
+  it('strips .srt extension', () => {
+    expect(extractReleaseNameFromUrl('https://cdn.example.com/movies/In.The.Grey.2026.BluRay.x265.srt'))
+      .toBe('In.The.Grey.2026.BluRay.x265');
+  });
+  it('decodes percent-encoding', () => {
+    expect(extractReleaseNameFromUrl('https://cdn.example.com/In%20The%20Grey%20BluRay.srt'))
+      .toBe('In The Grey BluRay');
+  });
+  it('skips purely numeric IDs', () => {
+    expect(extractReleaseNameFromUrl('https://cdn.example.com/subtitles/1962380715')).toBe('');
+  });
+  it('handles no extension', () => {
+    expect(extractReleaseNameFromUrl('https://cdn.example.com/In.The.Grey.2026.BluRay'))
+      .toBe('In.The.Grey.2026.BluRay');
+  });
+  it('returns empty for empty URL', () => {
+    expect(extractReleaseNameFromUrl('')).toBe('');
   });
 });

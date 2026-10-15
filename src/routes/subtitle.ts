@@ -211,6 +211,34 @@ function decodePathConfig(seg: string | undefined): string | undefined {
   }
 }
 
+/**
+ * Extract a release name from a subtitle URL when the upstream addon
+ * omits the metadata. Looks at the last URL path segment, strips
+ * extension + common query params, and decodes percent-encoding.
+ * Example: https://cdn.example.com/movies/In.The.Grey.2026.BluRay.x265.srt
+ *        → "In.The.Grey.2026.BluRay.x265"
+ */
+export function extractReleaseNameFromUrl(url: string): string {
+  if (!url) return '';
+  try {
+    const u = new URL(url);
+    const segments = u.pathname.split('/').filter(Boolean);
+    const last = segments[segments.length - 1] || '';
+    const dot = last.lastIndexOf('.');
+    // Only strip if the suffix looks like a subtitle/video extension
+    const ext = dot >= 0 ? last.slice(dot + 1).toLowerCase() : '';
+    const looksLikeFile = ['srt', 'vtt', 'ass', 'ssa', 'mkv', 'mp4', 'avi', 'ts', 'sub', 'txt'].includes(ext);
+    const base = looksLikeFile ? last.slice(0, dot) : last;
+    let decoded = base;
+    try { decoded = decodeURIComponent(base); } catch { /* keep raw */ }
+    // Skip purely numeric IDs (e.g. /1962380715)
+    if (/^\d+$/.test(decoded)) return '';
+    return decoded;
+  } catch {
+    return '';
+  }
+}
+
 async function subtitlesHandler(req: Request, res: Response) {
   const startedAt = Date.now();
   const budgetLeftMs = () => HANDLER_BUDGET_MS - (Date.now() - startedAt);
@@ -281,11 +309,19 @@ async function subtitlesHandler(req: Request, res: Response) {
       const upstreamSubUrl = `${subBaseUrl}/subtitles/${type}/${decodedId}.json`;
       const data = await fetchJson<{ subtitles: Subtitle[] }>(upstreamSubUrl);
       const subs = data?.subtitles || [];
-      return subs.map((s) => ({
-        ...s,
-        _source: sourceIdx,
-        _releaseName: ((s as any).releaseName || (s as any).fileName || '') as string,
-      } as Subtitle));
+      return subs.map((s) => {
+        // Prefer upstream's releaseName/fileName; fall back to extracting
+        // the filename from the URL path so the fast-align engine can still
+        // match against the video. Many sub addons omit the metadata
+        // field but encode the release in the URL path itself.
+        const raw = (s as any).releaseName || (s as any).fileName || '';
+        const releaseName = raw || extractReleaseNameFromUrl((s as any).url || '');
+        return {
+          ...s,
+          _source: sourceIdx,
+          _releaseName: releaseName,
+        } as Subtitle;
+      });
     })
   );
 
