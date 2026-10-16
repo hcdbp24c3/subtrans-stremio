@@ -38,6 +38,17 @@ export interface ChunkInput {
   entries: SubtitleEntry[];
   /** Call the provider with this batch of cues. */
   callProvider: (batch: SubtitleEntry[]) => Promise<Map<number, string>>;
+  /**
+   * Hook called for each successfully translated line. Use this to
+   * write to a per-line cache so a timed-out request can resume
+   * without re-translating cues that already succeeded.
+   */
+  onLineTranslated?: (globalPos: number, text: string) => void;
+  /**
+   * Optional list of already-translated 1-based positions to skip.
+   * Pre-fetched from the cache by the caller.
+   */
+  skipPositions?: ReadonlySet<number>;
   /** Source format for stitching the cache entry. */
   format: SubtitleFormat;
   /** Per-call timeout (ms). */
@@ -59,11 +70,13 @@ export interface ChunkResult {
   successChunks: number;
   /** Number of chunks that failed (timed out / errored). */
   failedChunks: number;
+  /** Number of lines skipped because they were already cached. */
+  skippedLines: number;
   /** True when >= 80% of chunks completed — the result is useful. */
   complete: boolean;
 }
 
-const DEFAULT_CHUNK_SIZE = 30;
+const DEFAULT_CHUNK_SIZE = 100; // larger batches work well for cloud LLMs (Gemini/DeepL/OpenAI)
 const DEFAULT_CONCURRENCY = 3;
 const MIN_CHUNK_SIZE = 5;
 
@@ -78,31 +91,50 @@ export async function translateInChunks(input: ChunkInput): Promise<ChunkResult>
   }
   const totalChunks = chunks.length;
   if (totalChunks === 0) {
-    return { lines: new Map(), totalChunks: 0, successChunks: 0, failedChunks: 0, complete: true };
+    return { lines: new Map(), totalChunks: 0, successChunks: 0, failedChunks: 0, skippedLines: 0, complete: true };
   }
 
   const merged = new Map<number, string>();
   let successCount = 0;
   let failCount = 0;
+  let skippedCount = 0;
   let nextChunkIdx = 0;
   const inFlight = new Set<Promise<void>>();
+  const skip = input.skipPositions;
 
   const launchNext = async (): Promise<void> => {
     const myIdx = nextChunkIdx++;
     if (myIdx >= totalChunks) return;
     const chunk = chunks[myIdx];
     const globalOffset = myIdx * chunkSize;
+    // Filter out positions that are already cached — pass the rest to the
+    // provider with renumbered local positions so the prompt is clean.
+    const localToGlobal: number[] = [];
+    const filteredBatch: SubtitleEntry[] = [];
+    for (let i = 0; i < chunk.length; i++) {
+      const globalPos = globalOffset + i + 1; // 1-based
+      if (skip && skip.has(globalPos)) {
+        skippedCount++;
+        continue;
+      }
+      localToGlobal.push(globalPos);
+      filteredBatch.push(chunk[i]);
+    }
+    if (filteredBatch.length === 0) {
+      successCount++;
+      return;
+    }
     try {
-      const result = await input.callProvider(chunk);
-      // Translate positions from local chunk index (1-based) to global
-      const localTranslated = new Map<number, string>();
-      for (const [pos, text] of result) {
-        const globalPos = globalOffset + pos; // 1-based position in original entries
+      const result = await input.callProvider(filteredBatch);
+      for (const [localPos, text] of result) {
+        // localPos is 1-based within filteredBatch; map back to global
+        const globalPos = localToGlobal[localPos - 1];
+        if (globalPos == null) continue;
         merged.set(globalPos, text);
-        localTranslated.set(pos, text);
+        input.onLineTranslated?.(globalPos, text);
       }
       successCount++;
-    } catch (e) {
+    } catch {
       failCount++;
     }
   };
@@ -136,6 +168,7 @@ export async function translateInChunks(input: ChunkInput): Promise<ChunkResult>
     totalChunks,
     successChunks: successCount,
     failedChunks: failCount,
+    skippedLines: skippedCount,
     complete,
   };
 }

@@ -30,6 +30,7 @@ import {
 } from './providers/types.js';
 import {
   getCachedTranslation, setCachedTranslation, CachedTranslation,
+  getCachedChunkLines, setCachedChunkLine,
 } from './translate-cache.js';
 import { translateInChunks } from './translate-chunker.js';
 
@@ -248,11 +249,19 @@ export async function runLingarrPipeline(
       continue;
     }
 
-    // 3. Translate in chunks. Local LLMs (Ollama 7-9B) can't translate
-    //    700+ cues in a single call — they time out. Chunking + parallel
-    //    keeps each request small (30 cues) and pipelines the work.
-    //    Cloud providers (Google/DeepL) also benefit from smaller batches.
+    // 3. Translate in chunks. Cloud LLMs (Gemini/DeepL/OpenAI) handle
+    //    100 cues per call in 1-3s; local LLMs (Ollama 7-9B) need 30.
+    //    Per-chunk cache lets a timed-out request resume from where it
+    //    left off instead of re-translating the whole sub.
     const perCallTimeout = input.perCallTimeoutMs ?? PER_CALL_TIMEOUT_DEFAULT;
+    const isLocalLlm = providerName === 'ollama' || /\bollama\b|\blocalai\b|\blm[ _-]?studio\b/i.test(model ?? '') || /\bollama\b|\blocalai\b/i.test(baseUrl ?? '');
+    const chunkSize = isLocalLlm ? 30 : 100;
+    const concurrency = isLocalLlm ? 5 : 3;
+
+    // Load any previously-translated lines for resume
+    const cachedLines = getCachedChunkLines(providerName, sourceCacheKey, sourceLang, target);
+    const skipPositions = new Set<number>(cachedLines.keys());
+
     const chunked = await translateInChunks({
       sourceLanguage: sourceLang,
       targetLanguage: target,
@@ -266,12 +275,18 @@ export async function runLingarrPipeline(
         const result = await translate(req);
         return result.ok ? result.lines : new Map();
       },
+      onLineTranslated: (globalPos, text) => {
+        // Persist each line so a future request can resume from here
+        const chunkIdx = Math.floor((globalPos - 1) / chunkSize);
+        setCachedChunkLine(providerName, sourceCacheKey, sourceLang, target, chunkIdx, globalPos, text);
+      },
+      skipPositions,
       format: fmt,
       timeoutMs: perCallTimeout,
-      concurrency: 3,
-      chunkSize: 30,
+      concurrency,
+      chunkSize,
     });
-    console.log(`[translate] ${target}: ${chunked.successChunks}/${chunked.totalChunks} chunks ok (${parsed.length} cues, provider=${providerName})`);
+    console.log(`[translate] ${target}: ${chunked.successChunks}/${chunked.totalChunks} chunks ok (${parsed.length} cues, ${cachedLines.size} resumed, provider=${providerName})`);
     if (chunked.lines.size === 0) {
       log.push({
         target, source: sourceLang, status: 'failed',
