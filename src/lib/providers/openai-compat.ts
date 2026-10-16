@@ -18,13 +18,16 @@ interface OpenAICompatConfig {
   label: string;
   defaultBaseUrl: string;
   defaultModel: string;
+  /** Most OpenAI-compat servers need a bearer key. Local servers (Ollama,
+   *  LocalAI without auth) can run with an empty key. */
+  requiresKey?: boolean;
 }
 
 function makeCompatProvider(cfg: OpenAICompatConfig): TranslationProvider {
   return {
     name: cfg.name,
     label: cfg.label,
-    requiresKey: true,
+    requiresKey: cfg.requiresKey ?? true,
     defaultBaseUrl: cfg.defaultBaseUrl,
     async translate(opts, req) {
       // Reuse the OpenAI provider's translate() — same shape, auth, parsing.
@@ -70,6 +73,7 @@ export const ollamaProvider = makeCompatProvider({
   defaultBaseUrl: 'http://localhost:11434',
   // Ollama has no default model. User must set config.translateModel.
   defaultModel: '',
+  requiresKey: false,
 });
 
 // Re-export so callers can use the OpenAI default if they want.

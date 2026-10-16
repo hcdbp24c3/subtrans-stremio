@@ -7,7 +7,8 @@ import { geminiProvider } from '../src/lib/providers/gemini.js';
 import { libretranslateProvider } from '../src/lib/providers/libretranslate.js';
 import { bingProvider } from '../src/lib/providers/bing.js';
 import { yandexProvider } from '../src/lib/providers/yandex.js';
-import { mistralProvider, xaiProvider } from '../src/lib/providers/openai-compat.js';
+import { openaiProvider } from '../src/lib/providers/openai.js';
+import { mistralProvider, xaiProvider, ollamaProvider } from '../src/lib/providers/openai-compat.js';
 import { buildChatPrompt, parseChatResponse } from '../src/lib/providers/_helpers.js';
 import { SubtitleEntry } from '../src/lib/subtitle-parser.js';
 
@@ -264,6 +265,24 @@ describe('openai-compat providers (Mistral, xAI)', () => {
     expect(url).toBe('https://api.x.ai/v1/chat/completions');
     const body = JSON.parse(String(init.body)) as { model: string };
     expect(body.model).toBe('grok-2-latest');
+  });
+
+  it('ollamaProvider does not require an API key', () => {
+    expect(ollamaProvider.requiresKey).toBe(false);
+    expect(ollamaProvider.defaultBaseUrl).toBe('http://localhost:11434');
+  });
+
+  it('openaiProvider skips Authorization header when apiKey is empty (Ollama/LocalAI)', async () => {
+    const mock = mockFetchOk((m) => m.mockResolvedValueOnce(
+      new Response(JSON.stringify({ choices: [{ message: { content: '1. x' } }] }), { status: 200 }),
+    ));
+    await openaiProvider.translate(
+      { apiKey: '', baseUrl: 'http://localhost:11434', model: 'llama3', timeoutMs: 5000 },
+      { sourceLanguage: 'en', targetLanguage: 'vi', lines: SAMPLE_ENTRIES },
+    );
+    const [, init] = (mock.mock.calls[0] ?? []) as [string, RequestInit];
+    const headers = init.headers as Record<string, string>;
+    expect(headers['Authorization']).toBeUndefined();
   });
 });
 

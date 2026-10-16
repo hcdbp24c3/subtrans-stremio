@@ -31,10 +31,15 @@ export const openaiProvider: TranslationProvider = {
     const model = opts.model ?? OPENAI_DEFAULT_MODEL;
     const { system, user } = buildChatPrompt(req);
 
+    // Local servers (Ollama, LocalAI without auth) accept an empty
+    // API key. Sending "Authorization: Bearer " with no token causes
+    // some servers to reject with 401. Skip the header when no key.
+    const authHeader = opts.apiKey ? bearerHeader(opts.apiKey) : {};
+
     const res = await safeFetch(url, {
       method: 'POST',
       headers: {
-        ...bearerHeader(opts.apiKey),
+        ...authHeader,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
