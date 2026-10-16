@@ -365,6 +365,16 @@ async function subtitlesHandler(req: Request, res: Response) {
   // translation pipeline reads the unfiltered sourceSubs so it can pick an
   // English source even when the user's display filter is narrow.
   let allSubs: Subtitle[] = filterByLanguage(sourceWithFormat, config.languages);
+  // If the user requested translation AND the display filter is narrow
+  // (so allSubs is empty), keep the unfiltered source subs as a fallback.
+  // When translate succeeds, the translated subs are appended and the
+  // English fallback becomes redundant but harmless (Stremio dedupes by
+  // id). When translate fails (network/rate-limit), the user still gets
+  // something to watch instead of an empty subtitle list.
+  if (allSubs.length === 0 && config.translateTargets.length > 0 && sourceSubs.length > 0) {
+    allSubs = [...sourceSubs];
+    console.log(`[subtitle] Display filter produced 0 subs; using ${sourceSubs.length} unfiltered source subs as translate-fallback`);
+  }
   allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
   const beforeDedupe = allSubs.length;
   allSubs = dedupeSubtitles(allSubs);
