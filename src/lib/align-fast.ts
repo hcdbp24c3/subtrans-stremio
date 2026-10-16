@@ -373,12 +373,36 @@ export async function calculateOffsetFast(
   const startedAt = Date.now();
   const remaining = () => budgetMs - (Date.now() - startedAt);
 
-  // 1. Release-name match (free)
-  const enCandidate = subs.find((s) => (s.lang || '').toLowerCase() === 'en' || (s.lang || '').toLowerCase() === 'eng')
-    || subs[0];
-  if (enCandidate) {
-    const rn = offsetByReleaseName(videoFilename, enCandidate._releaseName);
-    if (rn && rn.score >= 0.5) return rn;
+  // Pick the best source sub for sync. Prefer:
+  //  1. English subs whose release encode matches the video's encode
+  //     (BluRay→BluRay, WEB-DL→WEB-DL — usually already synced).
+  //  2. Any English sub with a non-empty release name.
+  //  3. First English sub.
+  //  4. First sub (last resort).
+  const videoEncodes = videoFilename ? new Set(extractReleaseEncode(videoFilename)) : new Set<string>();
+  const englishSubs = subs.filter((s) => {
+    const l = (s.lang || '').toLowerCase();
+    return l === 'en' || l === 'eng';
+  });
+  const enCandidate =
+    englishSubs.find((s) => {
+      if (!s._releaseName || videoEncodes.size === 0) return false;
+      const sEnc = extractReleaseEncode(s._releaseName);
+      return sEnc.some((e) => videoEncodes.has(e));
+    }) ??
+    englishSubs.find((s) => s._releaseName) ??
+    englishSubs[0] ??
+    subs[0];
+
+  // 1. Release-name match (free). Test ALL English subs, return the
+  //    first match. Don't just check subs[0] — when the upstream addon
+  //    returns WEB-DL subs first, the BluRay match is further down.
+  if (enCandidate && videoEncodes.size > 0) {
+    for (const s of englishSubs.length > 0 ? englishSubs : [enCandidate]) {
+      if (remaining() < 500) break;
+      const rn = offsetByReleaseName(videoFilename, s._releaseName);
+      if (rn && rn.score >= 0.5) return rn;
+    }
   }
 
   // 2. Sub consensus (needs ≥2 subs and known duration)
@@ -393,7 +417,6 @@ export async function calculateOffsetFast(
   if (videoUrl && enCandidate && remaining() > 4_000) {
     let entries: SubtitleEntry[] = enCandidate._entries || [];
     if (entries.length === 0) {
-      // Try to fetch the sub content
       const content = await fetchText(enCandidate.url);
       if (content) entries = parseSubtitle(content, enCandidate._format || 'srt');
     }
