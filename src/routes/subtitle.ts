@@ -637,6 +637,14 @@ async function subtitlesHandler(req: Request, res: Response) {
     console.log(`[subtitle] list not cached (alignment pending/incomplete)`);
   }
 
+  // Final summary for log analysis
+  const langCounts: Record<string, number> = {};
+  for (const s of result.subtitles) {
+    const l = s.lang || 'unknown';
+    langCounts[l] = (langCounts[l] || 0) + 1;
+  }
+  console.log(`[subtitle] response: ${result.subtitles.length} subs [${Object.entries(langCounts).map(([l, c]) => `${l}:${c}`).join(', ')}], offset=${offset.toFixed(2)}s, listCacheable=${listCacheable}`);
+
   res.json(result);
 }
 
