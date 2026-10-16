@@ -33,13 +33,15 @@ Hello world
 00:00:05,500 --> 00:00:08,000
 How are you`;
 
+type TranslateMockFn = (req: ProviderRequest) => Promise<TranslateResult>;
+
 function makeTranslateMock(
   response: Map<number, string> | ((req: ProviderRequest) => Map<number, string>),
-): ReturnType<typeof vi.fn> {
+): TranslateMockFn {
   return vi.fn(async (req: ProviderRequest) => {
     const lines = typeof response === 'function' ? response(req) : response;
     return { lines, ok: lines.size > 0 } satisfies TranslateResult;
-  });
+  }) as unknown as TranslateMockFn;
 }
 
 describe('runLingarrPipeline', () => {
@@ -197,11 +199,14 @@ describe('runLingarrPipeline', () => {
     const translate = vi.fn(async () => ({ lines: new Map(), ok: false, reason: 'rate limit' }));
     const out = await runLingarrPipeline({
       subs: [engSource], config: baseConfig, budgetMs: 10_000,
-      translate: translate as unknown as ReturnType<typeof makeTranslateMock>,
+      translate: translate as TranslateMockFn,
     });
     expect(out.translated).toBe(false);
     expect(out.log.every((l) => l.status === 'failed')).toBe(true);
-    expect(out.log[0].detail).toMatch(/rate limit/);
+    // The chunked pipeline reports "0/N chunks succeeded" instead of the
+    // raw provider reason (which is opaque across chunks). The original
+    // rate-limit reason still surfaces in [provider] log output.
+    expect(out.log[0].detail).toMatch(/0\/\d+ chunks succeeded/);
   });
 
   it('normalizes source lang via pickBestSource (eng upstream track → en)', async () => {

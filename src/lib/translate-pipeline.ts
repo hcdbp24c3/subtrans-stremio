@@ -31,6 +31,7 @@ import {
 import {
   getCachedTranslation, setCachedTranslation, CachedTranslation,
 } from './translate-cache.js';
+import { translateInChunks } from './translate-chunker.js';
 
 export interface LingarrPipelineInput {
   /** Upstream sub list (after dedupe + format detect). The pipeline
@@ -247,23 +248,40 @@ export async function runLingarrPipeline(
       continue;
     }
 
-    // 3. Build request and translate
-    const req: ProviderRequest = {
+    // 3. Translate in chunks. Local LLMs (Ollama 7-9B) can't translate
+    //    700+ cues in a single call — they time out. Chunking + parallel
+    //    keeps each request small (30 cues) and pipelines the work.
+    //    Cloud providers (Google/DeepL) also benefit from smaller batches.
+    const perCallTimeout = input.perCallTimeoutMs ?? PER_CALL_TIMEOUT_DEFAULT;
+    const chunked = await translateInChunks({
       sourceLanguage: sourceLang,
       targetLanguage: target,
-      lines: parsed,
-    };
-    const result = await translate(req);
-    if (!result.ok || result.lines.size === 0) {
+      entries: parsed,
+      callProvider: async (batch) => {
+        const req: ProviderRequest = {
+          sourceLanguage: sourceLang,
+          targetLanguage: target,
+          lines: batch,
+        };
+        const result = await translate(req);
+        return result.ok ? result.lines : new Map();
+      },
+      format: fmt,
+      timeoutMs: perCallTimeout,
+      concurrency: 3,
+      chunkSize: 30,
+    });
+    console.log(`[translate] ${target}: ${chunked.successChunks}/${chunked.totalChunks} chunks ok (${parsed.length} cues, provider=${providerName})`);
+    if (chunked.lines.size === 0) {
       log.push({
         target, source: sourceLang, status: 'failed',
-        detail: result.reason ?? 'empty translations', provider: providerName,
+        detail: `0/${chunked.totalChunks} chunks succeeded`, provider: providerName,
       });
       continue;
     }
 
     // 4. Stitch translated lines onto source timestamps
-    const translatedEntries = stitchEntries(parsed, result.lines);
+    const translatedEntries = stitchEntries(parsed, chunked.lines);
     setCachedTranslation(
       providerName,
       sourceCacheKey,
@@ -282,7 +300,7 @@ export async function runLingarrPipeline(
       targetLang: target,
       provider: providerName,
     }));
-    log.push({ target, source: sourceLang, status: 'translated', provider: providerName });
+    log.push({ target, source: sourceLang, status: 'translated', detail: `${chunked.successChunks}/${chunked.totalChunks} chunks`, provider: providerName });
     translatedAny = true;
   }
 
