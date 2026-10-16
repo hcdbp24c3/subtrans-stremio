@@ -21,6 +21,12 @@ describe('resolveRealUrl', () => {
     expect(resolveRealUrl(decoded)).toBe(decoded);
   });
 
+  it('decodes multiple layers of percent-encoding', () => {
+    const encoded = 'ensubtitles.org%252Fen%252Fdownload%252Ffile.srt';
+    const decoded = resolveRealUrl(encoded);
+    expect(decoded).toBe('https://ensubtitles.org/en/download/file.srt');
+  });
+
   it('handles fully-qualified URL with encoded path', () => {
     const encoded = 'https://ensubtitles.org%2Fen%2Fdownload%2Ffile.srt';
     const decoded = resolveRealUrl(encoded);

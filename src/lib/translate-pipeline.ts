@@ -236,6 +236,7 @@ export async function runLingarrPipeline(
     // 2. Download + parse the source sub (upstream URL).
     const subContent = await fetchText(sourceCacheKey);
     if (!subContent) {
+      console.log(`[translate] source fetch failed: ${sourceSub.id} url=${sourceCacheKey.slice(0, 120)} (raw=${(sourceSub.url || '').slice(0, 60)})`);
       log.push({ target, source: sourceLang, status: 'failed', detail: 'source fetch failed' });
       continue;
     }
