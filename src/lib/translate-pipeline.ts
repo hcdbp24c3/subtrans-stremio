@@ -84,7 +84,7 @@ export interface LingarrLogEntry {
   provider?: string;
 }
 
-const PER_CALL_TIMEOUT_DEFAULT = 30_000;
+const PER_CALL_TIMEOUT_DEFAULT = 60_000; // local LLMs (Ollama) need more time for 7-9B models
 /** Skip translation when the request budget has less than this much left. */
 const MIN_BUDGET_MS = 4_000;
 /** Per-language hard cap on translation round-trips for a single request. */
