@@ -14,6 +14,8 @@ export function bearerHeader(apiKey: string): Record<string, string> {
 /**
  * Fetch with timeout + abort signal. Returns the response or null on
  * any error (network, timeout, abort). Caller checks res.ok / res.status.
+ * Logs the error class so the operator can tell ECONNREFUSED apart
+ * from a timeout or DNS failure.
  */
 export async function safeFetch(
   url: string,
@@ -26,7 +28,11 @@ export async function safeFetch(
       signal: opts.signal ?? AbortSignal.timeout(opts.timeoutMs ?? PROVIDER_TIMEOUT_DEFAULT),
     });
     return res;
-  } catch {
+  } catch (e) {
+    const err = e as { name?: string; code?: string; message?: string; cause?: { code?: string } };
+    const reason =
+      err.cause?.code ?? err.code ?? err.name ?? 'unknown';
+    console.log(`[provider] fetch failed: url=${url.slice(0, 80)} reason=${reason} msg=${(err.message || '').slice(0, 100)}`);
     return null;
   }
 }
