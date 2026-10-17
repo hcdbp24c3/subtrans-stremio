@@ -66,7 +66,7 @@ export function decodeConfig(queryString: string): AddonConfig | null {
       translateKey: (params.get('tk') || '').trim(),
       translateBaseUrl: (params.get('tbu') || '').trim(),
       translateModel: (params.get('tm') || '').trim(),
-      translateTargets: params.getAll('translate').map((c) => c.trim()).filter(Boolean),
+      translateTargets: Array.from(new Set(params.getAll('translate').map((c) => c.trim()).filter(Boolean))),
     };
   } catch {
     return null;

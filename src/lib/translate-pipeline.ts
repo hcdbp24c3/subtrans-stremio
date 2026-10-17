@@ -173,10 +173,10 @@ export async function runLingarrPipeline(
     return { subs: input.subs, translated: false, log };
   }
 
-  const targets = (input.config.translateTargets ?? [])
+  const rawTargets = (input.config.translateTargets ?? [])
     .map((c) => normalizeLangForPipeline(c.trim()))
-    .filter(Boolean)
-    .slice(0, MAX_LANGS_PER_REQUEST);
+    .filter(Boolean);
+  const targets = Array.from(new Set(rawTargets)).slice(0, MAX_LANGS_PER_REQUEST);
   if (targets.length === 0) {
     console.log('[translate] pipeline skip: no targets after normalization');
     return { subs: input.subs, translated: false, log };
@@ -297,17 +297,19 @@ export async function runLingarrPipeline(
 
     // 4. Stitch translated lines onto source timestamps
     const translatedEntries = stitchEntries(parsed, chunked.lines);
-    setCachedTranslation(
-      providerName,
-      sourceCacheKey,
-      sourceLang,
-      target,
-      {
-        entries: translatedEntries,
-        format: fmt,
-        provider: providerName,
-      },
-    );
+    if (chunked.complete) {
+      setCachedTranslation(
+        providerName,
+        sourceCacheKey,
+        sourceLang,
+        target,
+        {
+          entries: translatedEntries,
+          format: fmt,
+          provider: providerName,
+        },
+      );
+    }
     newSubs.push(buildSyntheticSub(sourceSub, target, {
       entries: translatedEntries,
       format: fmt,

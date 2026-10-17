@@ -109,8 +109,8 @@ function resolveRedirect(url: string): string {
 async function resolveRedirectAsync(url: string): Promise<string> {
   try {
     const location = (await execAsync(
-      `curl -sI --max-time 10 "${url}" 2>/dev/null | grep -i "^location:" | tail -1 | tr -d '\\r' | awk '{print $2}'`,
-      15000,
+      `curl -sI --max-time 5 "${url}" 2>/dev/null | grep -i "^location:" | tail -1 | tr -d '\\r' | awk '{print $2}'`,
+      6000,
     )).trim();
     return location || url;
   } catch { return url; }
@@ -119,9 +119,11 @@ async function resolveRedirectAsync(url: string): Promise<string> {
 export async function getVideoDuration(url: string): Promise<number | null> {
   try {
     const probeUrl = await resolveRedirectAsync(url);
+    const isHttp = /^https?:\/\//i.test(probeUrl);
+    const netTimeout = isHttp ? '-timeout 5000000' : '';
     const result = (await execAsync(
-      `ffprobe -v error -show_entries format=duration -analyzeduration 5000000 -probesize 1000000 "${probeUrl}" 2>/dev/null`,
-      30000,
+      `ffprobe -v error ${netTimeout} -show_entries format=duration -analyzeduration 2000000 -probesize 1000000 "${probeUrl}" 2>/dev/null`,
+      6000,
     )).trim();
     const match = result.match(/duration=([\d.]+)/);
     return match ? parseFloat(match[1]) : null;
@@ -182,9 +184,11 @@ function parseProbeOutput(result: string): VideoProbeResult {
 export function probeVideoInfo(url: string): VideoProbeResult {
   const probeUrl = resolveRedirect(url);
   try {
+    const isHttp = /^https?:\/\//i.test(probeUrl);
+    const netTimeout = isHttp ? '-timeout 5000000' : '';
     const result = execSync(
-      `ffprobe -v error -show_entries stream=index,codec_name,codec_type:stream_tags=language,title -show_entries format=duration -of csv=p=0 "${probeUrl}" 2>/dev/null`,
-      { encoding: 'utf-8', timeout: 30000 },
+      `ffprobe -v error ${netTimeout} -analyzeduration 2000000 -probesize 1000000 -show_entries stream=index,codec_name,codec_type:stream_tags=language,title -show_entries format=duration -of csv=p=0 "${probeUrl}" 2>/dev/null`,
+      { encoding: 'utf-8', timeout: 6000 },
     ).trim();
     return parseProbeOutput(result);
   } catch {
@@ -193,12 +197,14 @@ export function probeVideoInfo(url: string): VideoProbeResult {
 }
 
 /** Non-blocking ffprobe — safe to run after the HTTP response is sent. */
-export async function probeVideoInfoAsync(url: string): Promise<VideoProbeResult> {
+export async function probeVideoInfoAsync(url: string, timeoutMs = 6000): Promise<VideoProbeResult> {
   try {
     const probeUrl = await resolveRedirectAsync(url);
+    const isHttp = /^https?:\/\//i.test(probeUrl);
+    const netTimeout = isHttp ? '-timeout 5000000' : '';
     const result = (await execAsync(
-      `ffprobe -v error -show_entries stream=index,codec_name,codec_type:stream_tags=language,title -show_entries format=duration -of csv=p=0 "${probeUrl}" 2>/dev/null`,
-      30000,
+      `ffprobe -v error ${netTimeout} -analyzeduration 2000000 -probesize 1000000 -show_entries stream=index,codec_name,codec_type:stream_tags=language,title -show_entries format=duration -of csv=p=0 "${probeUrl}" 2>/dev/null`,
+      timeoutMs,
     )).trim();
     return parseProbeOutput(result);
   } catch {
@@ -217,9 +223,11 @@ export interface SubtitleStreamInfo {
 /** List text-based subtitle streams in a video URL via ffprobe. */
 export function listSubtitleStreams(videoUrl: string): SubtitleStreamInfo[] {
   try {
+    const isHttp = /^https?:\/\//i.test(videoUrl);
+    const netTimeout = isHttp ? '-timeout 5000000' : '';
     const result = execSync(
-      `ffprobe -v error -show_entries stream=index,codec_name,codec_type:stream_tags=language,title -of csv=p=0 "${videoUrl}" 2>/dev/null`,
-      { encoding: 'utf-8', timeout: 30000 },
+      `ffprobe -v error ${netTimeout} -analyzeduration 2000000 -probesize 1000000 -show_entries stream=index,codec_name,codec_type:stream_tags=language,title -of csv=p=0 "${videoUrl}" 2>/dev/null`,
+      { encoding: 'utf-8', timeout: 6000 },
     ).trim();
     const textCodecs = ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'mov_text'];
     const streams: SubtitleStreamInfo[] = [];
@@ -344,12 +352,14 @@ async function runFfsubsyncLocal(refPath: string, targetSubContent: string, labe
  * Extract a bounded local audio sample (mono 16 kHz WAV) from a video URL.
  * Partial file on timeout is accepted if large enough for ffsubsync.
  */
-export async function extractAudioSample(videoUrl: string, seconds = 180, timeoutSec = 45): Promise<string | null> {
+export async function extractAudioSample(videoUrl: string, seconds = 45, timeoutSec = 10): Promise<string | null> {
   const tmpFile = join(tmpdir(), `audio_sample_${Date.now()}.wav`);
-  const cmd = `timeout ${timeoutSec} ffmpeg -y -i "${videoUrl}" -t ${seconds} -vn -ac 1 -ar 16000 -c:a pcm_s16le "${tmpFile}" 2>/dev/null`;
+  const isHttp = /^https?:\/\//i.test(videoUrl);
+  const netTimeout = isHttp ? '-timeout 5000000' : '';
+  const cmd = `timeout ${timeoutSec} ffmpeg -y ${netTimeout} -analyzeduration 2000000 -probesize 1000000 -i "${videoUrl}" -t ${seconds} -vn -ac 1 -ar 16000 -c:a pcm_s16le "${tmpFile}" 2>/dev/null`;
   try {
     console.log(`[aligner] Extracting ${seconds}s audio sample (timeout ${timeoutSec}s)...`);
-    await execAsync(cmd, (timeoutSec + 5) * 1000);
+    await execAsync(cmd, (timeoutSec + 2) * 1000);
   } catch {
     // timeout(1) leaves a partial WAV — recover if usable
     if (existsSync(tmpFile)) {
@@ -389,6 +399,7 @@ export async function extractAudioSample(videoUrl: string, seconds = 180, timeou
 export async function calculateOffsetWithFfsubsyncVideo(
   videoUrl: string,
   targetSubContent: string,
+  timeoutMs = 10000,
 ): Promise<BridgeRunResult> {
   const targetFile = join(tmpdir(), `ffs_target_${Date.now()}.srt`);
   try {
@@ -396,7 +407,7 @@ export async function calculateOffsetWithFfsubsyncVideo(
     return await runFfsubsyncBridge(
       ['video', videoUrl, targetFile, '--fast'],
       'video-fast',
-      15000, // tight timeout — let cascade fall through to audio-sample
+      timeoutMs,
     );
   } finally {
     try { unlinkSync(targetFile); } catch {}
@@ -412,15 +423,17 @@ export async function calculateOffsetWithFfsubsyncVideo(
 export async function extractBuiltInSubAsSrt(
   videoUrl: string,
   streamIndex: number,
-  timeoutSec = 12,
+  timeoutSec = 8,
 ): Promise<string | null> {
   const outFile = join(tmpdir(), `builtin_sub_${Date.now()}.srt`);
   // Try codec copy first (works for subrip/mov_text/webvtt in-place). If
   // ffmpeg rejects (PGS/ASS need transcode), the output file is missing or
   // empty and we fall through to null.
-  const cmd = `timeout ${timeoutSec} ffmpeg -y -i "${videoUrl}" -map 0:s:${streamIndex} -c:s copy -f srt "${outFile}" 2>/dev/null`;
+  const isHttp = /^https?:\/\//i.test(videoUrl);
+  const netTimeout = isHttp ? '-timeout 5000000' : '';
+  const cmd = `timeout ${timeoutSec} ffmpeg -y ${netTimeout} -analyzeduration 2000000 -probesize 1000000 -i "${videoUrl}" -map 0:s:${streamIndex} -c:s copy -f srt "${outFile}" 2>/dev/null`;
   try {
-    await execAsync(cmd, (timeoutSec + 3) * 1000);
+    await execAsync(cmd, (timeoutSec + 2) * 1000);
   } catch {
     // timeout(1) exit 124 — file may still be partial
   }
@@ -496,7 +509,7 @@ export async function calculateOffsetSmart(
   if (videoResult.ok) return { offset: videoResult.offset, method: 'video-remote', completed: true };
 
   // 3) Local audio sample + library sub-to-sub (works for PGS-only remuxes)
-  const wavPath = await extractAudioSample(videoUrl, 180, 30);
+  const wavPath = await extractAudioSample(videoUrl, 45, 10);
   if (wavPath) {
     try {
       const result = await runFfsubsyncLocal(wavPath, targetSubContent, 'audio-sample');

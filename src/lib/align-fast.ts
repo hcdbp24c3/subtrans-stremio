@@ -36,6 +36,15 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
 
+function execAsync(cmd: string, timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    exec(cmd, { encoding: 'utf-8', timeout: timeoutMs }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout);
+    });
+  });
+}
+
 export interface FastOffsetResult {
   /** Offset in seconds. Positive = sub is ahead of video (delay video, advance sub). */
   offset: number;
@@ -211,9 +220,10 @@ export async function offsetByMinimalVad(
   const sliceStart = Math.max(0, Math.min(duration - 30, duration * 0.25));
   const sliceDur = 15;
   const wavPath = join(tmpdir(), `vad_${Date.now()}.wav`);
-  // 16kHz mono s16le is the standard VAD input
-  const extractCmd = `timeout 6 ffmpeg -y -ss ${sliceStart.toFixed(1)} -i "${videoUrl}" -t ${sliceDur} -vn -ac 1 -ar 16000 -c:a pcm_s16le "${wavPath}" 2>/dev/null`;
-  try { execSync(extractCmd, { encoding: 'utf-8', timeout: 7000, stdio: 'pipe' }); } catch { /* timeout ok */ }
+  const isHttp = /^https?:\/\//i.test(videoUrl);
+  const netTimeout = isHttp ? '-timeout 5000000' : '';
+  const extractCmd = `timeout 6 ffmpeg -y ${netTimeout} -analyzeduration 2000000 -probesize 1000000 -ss ${sliceStart.toFixed(1)} -i "${videoUrl}" -t ${sliceDur} -vn -ac 1 -ar 16000 -c:a pcm_s16le "${wavPath}" 2>/dev/null`;
+  try { await execAsync(extractCmd, 6500); } catch { /* timeout ok */ }
   if (!existsSync(wavPath)) return null;
   const size = (() => { try { return statSync(wavPath).size; } catch { return 0; } })();
   if (size < 44 + 16000 * 2 * 2) { // < 2s of audio
@@ -327,11 +337,7 @@ print(json.dumps({"ok": True, "offset": round(offset_sec, 3), "score": round(sco
   const pyScript = join(tmpdir(), `vad_inline_${Date.now()}.py`);
   writeFileSync(pyScript, inlinePy, 'utf-8');
   try {
-    const stdout = execSync(`python3 "${pyScript}" 2>/dev/null`, {
-      encoding: 'utf-8',
-      timeout: timeoutMs,
-      stdio: 'pipe',
-    });
+    const stdout = await execAsync(`python3 "${pyScript}" 2>/dev/null`, timeoutMs);
     const lines = stdout.trim().split('\n');
     const last = lines[lines.length - 1];
     const result = JSON.parse(last) as { ok: boolean; offset?: number; score?: number; reason?: string };

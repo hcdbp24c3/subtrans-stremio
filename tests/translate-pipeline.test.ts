@@ -242,4 +242,15 @@ describe('runLingarrPipeline', () => {
     });
     expect(translate).toHaveBeenCalledTimes(5);
   });
+
+  it('deduplicates normalized target languages (e.g. vi and vie)', async () => {
+    const translate = makeTranslateMock(new Map([[1, 'x']]));
+    await runLingarrPipeline({
+      subs: [engSource],
+      config: { ...baseConfig, translateTargets: ['vi', 'vie'] },
+      budgetMs: 60_000,
+      translate,
+    });
+    expect(translate).toHaveBeenCalledTimes(1);
+  });
 });

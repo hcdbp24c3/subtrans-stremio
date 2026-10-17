@@ -25,14 +25,13 @@ const subDownloadCache = createTtlStore<{ body: Buffer; contentType: string }>(1
 const alignedSubCache = createTtlStore<{ body: Buffer; contentType: string }>(100);
 const ALIGNED_SUB_TTL_MS = 30 * 60 * 1000; // ≥ subtitle list cache TTL
 
-// Nuvio client aborts each addon after 30s; Stremio web ~60s. Local LLM
-// translation (Ollama 7-9B) typically needs 10-25s per call, so we use
-// 35s to fit one round-trip plus alignment in a single request.
-export const HANDLER_BUDGET_MS = 35_000;
+// Nuvio client aborts each addon after 30s; Stremio web ~60s.
+// Keeping handler budget to 24s guarantees response arrives safely before client timeout.
+export const HANDLER_BUDGET_MS = 24_000;
 const RESPONSE_MARGIN_MS = 2_000;
-const MIN_ALIGN_WAIT_MS = 3_000;   // don't bother racing alignment under this
-const MIN_APPLY_MS = 4_000;        // need time to re-download + adjust subs
-const PROBE_MIN_MS = 4_000;        // skip ffprobe when the budget is already tight
+const MIN_ALIGN_WAIT_MS = 2_500;   // don't bother racing alignment under this
+const MIN_APPLY_MS = 3_000;        // need time to re-download + adjust subs
+const PROBE_MIN_MS = 3_000;        // skip ffprobe when the budget is already tight
 const TRANSLATE_MIN_MS = 3_000;    // skip translate when budget is too tight
 
 let ffsubsyncAvailable: boolean | null = null;
@@ -418,10 +417,27 @@ async function subtitlesHandler(req: Request, res: Response) {
   if (willAlign) {
     alignPromise = (async () => {
       // 1. Try fast engine (release-name, sub-consensus, minimal-vad).
-      //    These are free or <2s and cover most real-world cases.
+      //    Release name match is instant (<1ms) and needs no probe.
+      const fastBudget = Math.max(2_000, budgetLeftMs() - 6_000);
+      const earlyFast = await calculateOffsetFast(
+        videoUrl!,
+        videoFilename,
+        null,
+        sourceWithFormat,
+        Math.min(fastBudget, 2_000),
+      );
+      if (earlyFast && earlyFast.score >= 0.5 && earlyFast.method === 'release-name') {
+        setOffsetCache(videoUrl!, earlyFast.offset);
+        console.log(
+          `[subtitle] fast-align (instant): offset=${earlyFast.offset.toFixed(3)}s via ${earlyFast.method}` +
+          (earlyFast.offset === 0 ? ' (already synced)' : ''),
+        );
+        return { offset: earlyFast.offset, completed: true, method: earlyFast.method };
+      }
+
+      // If release-name didn't match immediately, wait for video probe (bounded)
       const probe = await probePromise;
       const videoDuration = probe?.duration ?? null;
-      const fastBudget = Math.max(2_000, budgetLeftMs() - 8_000);
       // Diagnostic: log what fast-align saw
       const releaseNames = sourceWithFormat.slice(0, 5).map((s) => ({
         id: s.id,
@@ -549,12 +565,19 @@ async function subtitlesHandler(req: Request, res: Response) {
     });
   }
 
-  // Wait for translate first — it's usually the longest pole and we need
-  // its output to know whether to apply offset to translated subs.
-  const translateResult = await translatePromise;
+  // Wait for translate first — bounded by remaining budget so client never hangs.
+  // When budget runs out, let it finish in background to warm cache for subsequent requests.
+  const remainingForTranslate = Math.max(0, budgetLeftMs() - 4_000);
+  const translateResult = await Promise.race([
+    translatePromise,
+    sleep(remainingForTranslate).then(() => null),
+  ]);
   if (translateResult) {
     allSubs = [...allSubs, ...translateResult.translated];
     allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
+  } else if (config.translateTargets.length > 0) {
+    console.log(`[subtitle] translate exceeded budget (${remainingForTranslate}ms) — serving available subs, continuing in background`);
+    translatePromise.catch(() => {});
   }
 
   // Wait for align — usually finishes in ~3-6s when ffsubsync finds
