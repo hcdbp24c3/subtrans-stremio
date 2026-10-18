@@ -26,13 +26,13 @@ const alignedSubCache = createTtlStore<{ body: Buffer; contentType: string }>(10
 const ALIGNED_SUB_TTL_MS = 30 * 60 * 1000; // ≥ subtitle list cache TTL
 
 // Nuvio client aborts each addon after 30s; Stremio web ~60s.
-// Keeping handler budget to 24s guarantees response arrives safely before client timeout.
-export const HANDLER_BUDGET_MS = 24_000;
-const RESPONSE_MARGIN_MS = 2_000;
-const MIN_ALIGN_WAIT_MS = 2_500;   // don't bother racing alignment under this
-const MIN_APPLY_MS = 3_000;        // need time to re-download + adjust subs
-const PROBE_MIN_MS = 3_000;        // skip ffprobe when the budget is already tight
-const TRANSLATE_MIN_MS = 3_000;    // skip translate when budget is too tight
+// Keeping handler budget to 28s guarantees response arrives safely before client timeout.
+export const HANDLER_BUDGET_MS = 28_000;
+const RESPONSE_MARGIN_MS = 1_500;
+const MIN_ALIGN_WAIT_MS = 2_000;   // don't bother racing alignment under this
+const MIN_APPLY_MS = 2_500;        // need time to re-download + adjust subs
+const PROBE_MIN_MS = 2_500;        // skip ffprobe when the budget is already tight
+const TRANSLATE_MIN_MS = 2_500;    // skip translate when budget is too tight
 
 let ffsubsyncAvailable: boolean | null = null;
 function ffsubsyncReady(): boolean {
@@ -369,7 +369,8 @@ async function subtitlesHandler(req: Request, res: Response) {
   // English fallback becomes redundant but harmless (Stremio dedupes by
   // id). When translate fails (network/rate-limit), the user still gets
   // something to watch instead of an empty subtitle list.
-  if (allSubs.length === 0 && config.translateTargets.length > 0 && sourceSubs.length > 0) {
+  const usedFallback = allSubs.length === 0 && config.translateTargets.length > 0 && sourceSubs.length > 0;
+  if (usedFallback) {
     allSubs = [...sourceSubs];
     console.log(`[subtitle] Display filter produced 0 subs; using ${sourceSubs.length} unfiltered source subs as translate-fallback`);
   }
@@ -567,45 +568,44 @@ async function subtitlesHandler(req: Request, res: Response) {
 
   // Wait for translate first — bounded by remaining budget so client never hangs.
   // When budget runs out, let it finish in background to warm cache for subsequent requests.
-  const remainingForTranslate = Math.max(0, budgetLeftMs() - 4_000);
+  const marginAfterTranslate = (offset !== 0 && offset !== null)
+    ? (RESPONSE_MARGIN_MS + MIN_APPLY_MS)
+    : (RESPONSE_MARGIN_MS + 500);
+  const remainingForTranslate = Math.max(0, budgetLeftMs() - marginAfterTranslate);
   const translateResult = await Promise.race([
     translatePromise,
     sleep(remainingForTranslate).then(() => null),
   ]);
-  if (translateResult) {
-    allSubs = [...allSubs, ...translateResult.translated];
+  if (translateResult && translateResult.translated.length > 0) {
+    if (usedFallback) {
+      // User only wanted translated language (filter had 0 subs) — prioritize translated subs!
+      allSubs = [...translateResult.translated, ...allSubs];
+    } else {
+      allSubs = [...allSubs, ...translateResult.translated];
+    }
     allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
   } else if (config.translateTargets.length > 0) {
     console.log(`[subtitle] translate exceeded budget (${remainingForTranslate}ms) — serving available subs, continuing in background`);
     translatePromise.catch(() => {});
   }
 
-  // Wait for align — usually finishes in ~3-6s when ffsubsync finds
-  // built-in subs; ~10-20s with audio extraction.
+  // Wait for align — usually finishes in parallel with translate.
+  // If alignPromise has already completed (e.g. early fast align), Promise.race resolves instantly (0ms).
   let listCacheable = true;
-  const remainingForAlign = budgetLeftMs() - RESPONSE_MARGIN_MS;
-  if (willAlign && remainingForAlign > 0) {
-    if (remainingForAlign < MIN_ALIGN_WAIT_MS) {
-      console.log(`[subtitle] time budget low for align — letting it finish in background, serving with offset=${offset}`);
-      alignPromise.catch(() => {}); // fire-and-forget warm
+  if (willAlign) {
+    const remainingForAlign = Math.max(0, budgetLeftMs() - RESPONSE_MARGIN_MS);
+    const alignResult = await Promise.race([
+      alignPromise,
+      sleep(remainingForAlign).then(() => null),
+    ]);
+    if (alignResult === null) {
+      alignPromise.catch(() => {});
       listCacheable = false;
+      console.log(`[subtitle] alignment exceeded budget — serving with offset=${offset}, warming in background`);
     } else {
-      const alignResult = await Promise.race([
-        alignPromise,
-        sleep(remainingForAlign),
-      ]);
-      if (alignResult === null) {
-        // Timed out — keep waiting in background to warm cache
-        alignPromise.catch(() => {});
-        listCacheable = false;
-        console.log(`[subtitle] alignment exceeded budget — serving with offset=${offset}, warming in background`);
-      } else {
-        offset = alignResult.offset;
-        if (!alignResult.completed) listCacheable = false;
-      }
+      offset = alignResult.offset;
+      if (!alignResult.completed) listCacheable = false;
     }
-  } else if (willAlign) {
-    listCacheable = false;
   }
 
   // 7. If offset detected, apply to all subs (including translated ones
@@ -678,6 +678,35 @@ async function subtitlesHandler(req: Request, res: Response) {
   console.log(`[subtitle] response: ${result.subtitles.length} subs [${Object.entries(langCounts).map(([l, c]) => `${l}:${c}`).join(', ')}], offset=${offset.toFixed(2)}s, listCacheable=${listCacheable}`);
 
   res.json(result);
+
+  // If translate was still running in background, warm the list cache when it finishes
+  // so the user's next request / subtitle select gets the translated sub instantly.
+  if (config.translateTargets.length > 0 && translatePromise) {
+    translatePromise.then(async (res) => {
+      if (!res || !res.translated || res.translated.length === 0) return;
+      try {
+        const materialized = await materializeTranslatedSubs(res.translated);
+        const finalTranslated = materialized.map((sub) => {
+          if (sub._aligned && sub.url.startsWith('aligned:')) {
+            const token = sub.url.slice('aligned:'.length);
+            return { ...sub, url: `${base}/alignedsub/${token}.srt` };
+          }
+          return sub;
+        });
+        const currentList = getFromCache(key);
+        const baseSubs = currentList?.subtitles ?? finalSubtitles;
+        const merged = [...finalTranslated, ...baseSubs];
+        const deduped = dedupeSubtitles(limitPerLanguage(merged, MAX_SUBS_PER_LANG));
+        const updatedResult = {
+          subtitles: deduped.map(({ _format, _aligned, _source, _releaseName, _entries, ...rest }: any) => rest),
+        };
+        setCache(key, updatedResult);
+        console.log(`[subtitle] background translate finished and populated list cache (${updatedResult.subtitles.length} subs)`);
+      } catch (err: any) {
+        console.log(`[subtitle] background translate cache update failed: ${err?.message}`);
+      }
+    }).catch(() => {});
+  }
 }
 
 router.get('/subtitles/:type/*', subtitlesHandler);

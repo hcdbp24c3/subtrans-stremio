@@ -256,7 +256,7 @@ export async function runLingarrPipeline(
     const perCallTimeout = input.perCallTimeoutMs ?? PER_CALL_TIMEOUT_DEFAULT;
     const isLocalLlm = providerName === 'ollama' || /\bollama\b|\blocalai\b|\blm[ _-]?studio\b/i.test(model ?? '') || /\bollama\b|\blocalai\b/i.test(baseUrl ?? '');
     const chunkSize = isLocalLlm ? 30 : 100;
-    const concurrency = isLocalLlm ? 5 : 3;
+    const concurrency = isLocalLlm ? 3 : 3;
 
     // Load any previously-translated lines for resume
     const cachedLines = getCachedChunkLines(providerName, sourceCacheKey, sourceLang, target);

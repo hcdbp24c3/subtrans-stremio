@@ -52,6 +52,17 @@ export function encodeConfig(config: AddonConfig): string {
   return params.toString();
 }
 
+function normalizeTargetLang(code: string): string {
+  const c = code.trim().toLowerCase();
+  if (c.length <= 2) return c;
+  const m: Record<string, string> = {
+    eng: 'en', vie: 'vi', jpn: 'ja', kor: 'ko', zho: 'zh', tha: 'th',
+    ind: 'id', msa: 'ms', fra: 'fr', deu: 'de', spa: 'es', por: 'pt',
+    ita: 'it', rus: 'ru', ara: 'ar', hin: 'hi', tur: 'tr', pol: 'pl',
+  };
+  return m[c] ?? c;
+}
+
 export function decodeConfig(queryString: string): AddonConfig | null {
   try {
     const params = new URLSearchParams(queryString);
@@ -66,7 +77,7 @@ export function decodeConfig(queryString: string): AddonConfig | null {
       translateKey: (params.get('tk') || '').trim(),
       translateBaseUrl: (params.get('tbu') || '').trim(),
       translateModel: (params.get('tm') || '').trim(),
-      translateTargets: Array.from(new Set(params.getAll('translate').map((c) => c.trim()).filter(Boolean))),
+      translateTargets: Array.from(new Set(params.getAll('translate').map(normalizeTargetLang).filter(Boolean))),
     };
   } catch {
     return null;
