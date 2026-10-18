@@ -255,7 +255,7 @@ export async function runLingarrPipeline(
     //    left off instead of re-translating the whole sub.
     const perCallTimeout = input.perCallTimeoutMs ?? PER_CALL_TIMEOUT_DEFAULT;
     const isLocalLlm = providerName === 'ollama' || /\bollama\b|\blocalai\b|\blm[ _-]?studio\b/i.test(model ?? '') || /\bollama\b|\blocalai\b/i.test(baseUrl ?? '');
-    const chunkSize = isLocalLlm ? 30 : 100;
+    const chunkSize = isLocalLlm ? 35 : 100;
     const concurrency = isLocalLlm ? 3 : 3;
 
     // Load any previously-translated lines for resume
@@ -272,7 +272,10 @@ export async function runLingarrPipeline(
           targetLanguage: target,
           lines: batch,
         };
-        const result = await translate(req);
+        let result = await translate(req);
+        if (!result.ok && !input.translate) {
+          result = await translate(req);
+        }
         return result.ok ? result.lines : new Map();
       },
       onLineTranslated: (globalPos, text) => {
