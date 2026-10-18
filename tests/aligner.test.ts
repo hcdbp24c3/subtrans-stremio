@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  calculateOffsetFromReference, adjustEntries, parseFfsubsyncOutput,
+  calculateOffsetFromReference, calculateOffsetFromTiming, adjustEntries, parseFfsubsyncOutput,
   parseFfsubsyncBridgeJson, countSrtEntries, parseDurationFromProbeLine, SubtitleEntry,
 } from '../src/lib/aligner.js';
 
@@ -188,5 +188,51 @@ describe('aligner', () => {
     const adjusted = adjustEntries(entries, -5);
     expect(adjusted[0].start).toBe(0);
     expect(adjusted[0].end).toBe(0);
+  });
+
+  // ── calculateOffsetFromTiming ──────────────────────────────────────
+
+  it('detects offset between subtitles of different languages based on speech pauses', () => {
+    // English reference
+    const ref: SubtitleEntry[] = [
+      { start: 12.5, end: 14.5, text: 'Welcome to the show.' },
+      { start: 18.0, end: 20.0, text: 'We have a great guest tonight.' },
+      { start: 25.5, end: 27.5, text: 'Please give a warm welcome.' },
+      { start: 35.0, end: 37.0, text: 'Thank you everyone!' },
+      { start: 45.0, end: 47.0, text: 'Let us begin.' },
+    ];
+    // Vietnamese target with 2.5s early shift (start - 2.5s)
+    const target: SubtitleEntry[] = [
+      { start: 10.0, end: 12.0, text: 'Chào mừng các bạn đến với chương trình.' },
+      { start: 15.5, end: 17.5, text: 'Tối nay chúng ta có một vị khách tuyệt vời.' },
+      { start: 23.0, end: 25.0, text: 'Hãy cùng cho một tràng pháo tay.' },
+      { start: 32.5, end: 34.5, text: 'Cảm ơn mọi người!' },
+      { start: 42.5, end: 44.5, text: 'Hãy bắt đầu thôi.' },
+    ];
+
+    const result = calculateOffsetFromTiming(ref, target);
+    expect(result.score).toBeGreaterThanOrEqual(0.8);
+    expect(Math.round(result.offset * 10) / 10).toBe(2.5);
+  });
+
+  it('detects zero offset when speech cues already align', () => {
+    const ref: SubtitleEntry[] = [
+      { start: 10.0, end: 12.0, text: 'Hello' },
+      { start: 20.0, end: 22.0, text: 'World' },
+      { start: 30.0, end: 32.0, text: 'How are you' },
+      { start: 40.0, end: 42.0, text: 'Fine' },
+      { start: 50.0, end: 52.0, text: 'Bye' },
+    ];
+    const target: SubtitleEntry[] = [
+      { start: 10.0, end: 12.0, text: 'Xin chào' },
+      { start: 20.0, end: 22.0, text: 'Thế giới' },
+      { start: 30.0, end: 32.0, text: 'Bạn khỏe không' },
+      { start: 40.0, end: 42.0, text: 'Khỏe' },
+      { start: 50.0, end: 52.0, text: 'Tạm biệt' },
+    ];
+
+    const result = calculateOffsetFromTiming(ref, target);
+    expect(result.offset).toBe(0);
+    expect(result.score).toBe(1.0);
   });
 });

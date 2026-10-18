@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { offsetByReleaseName, extractReleaseEncode } from '../src/lib/align-fast.js';
+import {
+  offsetByReleaseName, extractReleaseEncode, scoreReleaseMatch, findReferenceSub,
+} from '../src/lib/align-fast.js';
 import { extractReleaseNameFromUrl } from '../src/routes/subtitle.js';
 
 describe('extractReleaseEncode', () => {
@@ -61,5 +63,44 @@ describe('extractReleaseNameFromUrl', () => {
   });
   it('returns empty for empty URL', () => {
     expect(extractReleaseNameFromUrl('')).toBe('');
+  });
+});
+
+describe('scoreReleaseMatch', () => {
+  const VIDEO = 'In.The.Grey.2026.2160p.UHD.BluRay.REMUX.HDR.MULTi[Ben The Men].mkv';
+
+  it('matches bluray remux with same group', () => {
+    const sub = 'In.The.Grey.2026.2160p.BluRay.REMUX.x265[Ben The Men].srt';
+    const match = scoreReleaseMatch(VIDEO, sub);
+    expect(match.matched).toBe(true);
+    expect(match.score).toBeGreaterThanOrEqual(10);
+  });
+
+  it('matches bluray to remux across groups', () => {
+    const sub = 'In.The.Grey.2026.1080p.BluRay.x264-SPARKS.srt';
+    const match = scoreReleaseMatch(VIDEO, sub);
+    expect(match.matched).toBe(true);
+  });
+
+  it('rejects web-dl when video is bluray remux', () => {
+    const sub = 'In.The.Grey.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb.srt';
+    const match = scoreReleaseMatch(VIDEO, sub);
+    expect(match.matched).toBe(false);
+  });
+});
+
+describe('findReferenceSub', () => {
+  const VIDEO = 'In.The.Grey.2026.2160p.UHD.BluRay.REMUX.HDR.MULTi[Ben The Men].mkv';
+  const subs = [
+    { id: 'sub-web', url: 'https://example.com/web.srt', lang: 'en', _releaseName: 'In.The.Grey.2026.WEB-DL.srt' },
+    { id: 'sub-bd-vi', url: 'https://example.com/bd-vi.srt', lang: 'vi', _releaseName: 'In.The.Grey.2026.BluRay.REMUX.srt' },
+    { id: 'sub-bd-en', url: 'https://example.com/bd-en.srt', lang: 'en', _releaseName: 'In.The.Grey.2026.BluRay.REMUX.x265[Ben The Men].srt' },
+  ];
+
+  it('selects the release-matched English sub as benchmark', () => {
+    const found = findReferenceSub(subs, VIDEO);
+    expect(found).not.toBeNull();
+    expect(found!.sub.id).toBe('sub-bd-en');
+    expect(found!.isReleaseMatch).toBe(true);
   });
 });

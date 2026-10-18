@@ -5,11 +5,11 @@ import {
   detectFormat, sniffFormat, parseSubtitle, SubtitleFormat, SubtitleEntry,
 } from '../lib/subtitle-parser.js';
 import {
-  calculateOffsetSmart, adjustEntries,
-  isFfsubsyncAvailable,
-  probeVideoInfoAsync, SmartOffsetResult, VideoProbeResult,
+  adjustEntries, calculateOffsetFromTiming,
 } from '../lib/aligner.js';
-import { calculateOffsetFast, FastOffsetResult } from '../lib/align-fast.js';
+import {
+  scoreReleaseMatch, findReferenceSub,
+} from '../lib/align-fast.js';
 import { detectFileExt } from './subtitle-ext.js';
 import { createTtlStore } from '../lib/ttl-store.js';
 import { resolveRealUrl } from '../lib/proxy-resolve.js';
@@ -29,18 +29,7 @@ const ALIGNED_SUB_TTL_MS = 30 * 60 * 1000; // ≥ subtitle list cache TTL
 // Keeping handler budget to 28s guarantees response arrives safely before client timeout.
 export const HANDLER_BUDGET_MS = 28_000;
 const RESPONSE_MARGIN_MS = 1_500;
-const MIN_ALIGN_WAIT_MS = 2_000;   // don't bother racing alignment under this
-const MIN_APPLY_MS = 2_500;        // need time to re-download + adjust subs
-const PROBE_MIN_MS = 2_500;        // skip ffprobe when the budget is already tight
-const TRANSLATE_MIN_MS = 2_500;    // skip translate when budget is too tight
-
-let ffsubsyncAvailable: boolean | null = null;
-function ffsubsyncReady(): boolean {
-  if (ffsubsyncAvailable === null) {
-    ffsubsyncAvailable = isFfsubsyncAvailable();
-  }
-  return ffsubsyncAvailable;
-}
+const TRANSLATE_MIN_MS = 2_500;
 
 function sleep(ms: number): Promise<null> {
   return new Promise((resolve) => setTimeout(() => resolve(null), Math.max(0, ms)));
@@ -83,28 +72,6 @@ interface CacheEntry {
 }
 
 const cache = new Map<string, CacheEntry>();
-
-// Separate offset cache: keyed by video URL (reusable across requests)
-const offsetCache = new Map<string, { offset: number; expires: number }>();
-const OFFSET_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
-
-function getOffsetFromCache(videoUrl: string): number | null {
-  const entry = offsetCache.get(videoUrl);
-  if (!entry) return null;
-  if (Date.now() > entry.expires) { offsetCache.delete(videoUrl); return null; }
-  console.log(`[subtitle] Using cached offset: ${entry.offset.toFixed(1)}s for this video`);
-  return entry.offset;
-}
-
-/** Cache offset whenever alignment completed — including 0 (already synced). */
-function setOffsetCache(videoUrl: string, offset: number): void {
-  if (offsetCache.size > 50) {
-    const oldest = offsetCache.keys().next().value;
-    if (oldest) offsetCache.delete(oldest);
-  }
-  offsetCache.set(videoUrl, { offset, expires: Date.now() + OFFSET_CACHE_TTL });
-  console.log(`[subtitle] Offset cached for this video: ${offset.toFixed(3)}s`);
-}
 
 function cacheKey(config: AddonConfig, type: string, id: string): string {
   return `${config.streamUrls.join(',')}|${config.subUrls.join(',')}|${type}|${id}`;
@@ -237,6 +204,34 @@ export function extractReleaseNameFromUrl(url: string): string {
   }
 }
 
+async function fetchAndParseSubEntries(sub: Subtitle): Promise<SubtitleEntry[]> {
+  if (sub._entries && sub._entries.length > 0) return sub._entries;
+  const realUrl = resolveRealUrl(sub.url);
+  const cached = subDownloadCache.get(realUrl);
+  let text = cached ? cached.body.toString('utf-8') : null;
+  if (!text) {
+    try {
+      text = await fetchText(realUrl);
+      if (text) {
+        subDownloadCache.set(
+          realUrl,
+          { body: Buffer.from(text, 'utf-8'), contentType: 'text/plain' },
+          SUB_DOWNLOAD_CACHE_TTL_MS,
+        );
+      }
+    } catch {
+      return [];
+    }
+  }
+  if (!text) return [];
+  const fmt = (sub._format || detectFormat(sub.url) || 'srt') as SubtitleFormat;
+  try {
+    return parseSubtitle(text, fmt);
+  } catch {
+    return [];
+  }
+}
+
 async function subtitlesHandler(req: Request, res: Response) {
   const startedAt = Date.now();
   const budgetLeftMs = () => HANDLER_BUDGET_MS - (Date.now() - startedAt);
@@ -323,19 +318,8 @@ async function subtitlesHandler(req: Request, res: Response) {
     })
   );
 
-  // Wait for stream info first (we need videoUrl for offset cache / probe)
+  // Wait for stream info first (we need videoFilename for release matching)
   await streamPromise;
-
-  // 2c. Offset cache first — skip everything else on hit.
-  let offset = 0;
-  let offsetFromCache = false;
-  if (videoUrl) {
-    const cachedOffset = getOffsetFromCache(videoUrl);
-    if (cachedOffset !== null) {
-      offset = cachedOffset;
-      offsetFromCache = true;
-    }
-  }
 
   // Wait for subs (parallel with stream)
   const subResults = await subPromise;
@@ -359,177 +343,100 @@ async function subtitlesHandler(req: Request, res: Response) {
     _format: detectFormat(sub.url) || undefined,
   })) as Subtitle[];
 
-  // Display list = language-filtered + deduped + per-lang limited. The
-  // translation pipeline reads the unfiltered sourceSubs so it can pick an
-  // English source even when the user's display filter is narrow.
-  let allSubs: Subtitle[] = filterByLanguage(sourceWithFormat, config.languages);
-  // If the user requested translation AND the display filter is narrow
-  // (so allSubs is empty), keep the unfiltered source subs as a fallback.
-  // When translate succeeds, the translated subs are appended and the
-  // English fallback becomes redundant but harmless (Stremio dedupes by
-  // id). When translate fails (network/rate-limit), the user still gets
-  // something to watch instead of an empty subtitle list.
-  const usedFallback = allSubs.length === 0 && config.translateTargets.length > 0 && sourceSubs.length > 0;
-  if (usedFallback) {
-    allSubs = [...sourceSubs];
-    console.log(`[subtitle] Display filter produced 0 subs; using ${sourceSubs.length} unfiltered source subs as translate-fallback`);
-  }
-  allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
-  const beforeDedupe = allSubs.length;
-  allSubs = dedupeSubtitles(allSubs);
-  if (allSubs.length !== beforeDedupe) {
-    console.log(`[subtitle] Deduped ${beforeDedupe - allSubs.length} duplicate URL(s)`);
-  }
-  if (sourceSubs.length !== allSubs.length) {
-    console.log(`[subtitle] Display filter: ${allSubs.length}/${sourceSubs.length} subs (languages="${config.languages || '*'}")`);
+  // 3. Find Benchmark Reference Subtitle ("Sub Chuẩn" - đã trùng codec/release)
+  const benchmark = findReferenceSub(sourceWithFormat, videoFilename);
+  const benchmarkSub = benchmark?.sub ?? sourceWithFormat[0];
+  const isBenchmarkSynced = benchmark?.isReleaseMatch ?? false;
+  if (benchmarkSub) {
+    console.log(
+      `[subtitle] benchmark sub: ${benchmarkSub.id} [${benchmarkSub.lang || 'und'}], ` +
+      `releaseMatch=${isBenchmarkSynced} (score=${benchmark?.matchScore ?? 0})`
+    );
   }
 
-  // ────────────────────────────────────────────────────────────────────
-  // Parallel pipeline: probe + translate + ffsubsync run concurrently.
-  // Translation uses sourceWithFormat (unfiltered, format-detected) so it
-  // can pick an English source even when the display filter is narrow.
-  // Offset is applied to the translated entries AFTER alignment completes
-  // — translated subs inherit the source sub's timing, so the same offset
-  // must shift them by the same amount.
-  // ────────────────────────────────────────────────────────────────────
-  const canAlign = !!videoUrl && !offsetFromCache && ffsubsyncReady() && budgetLeftMs() > PROBE_MIN_MS;
-  const canProbe = !!videoUrl && (canAlign || (
-    config.translateTargets.length > 0
-    && (config.subUrls.length === 0 || config.subUrls.every((u) => !u || u === 'x'))
-  ));
+  // 4. Target language filter (e.g. "vi,vie" or "vi")
+  const targetSubs = filterByLanguage(sourceWithFormat, config.languages);
 
-  // 2c.i Probe (separate from align so it can run in parallel with translate)
-  const probePromise: Promise<VideoProbeResult | null> = (async () => {
-    if (!videoUrl || !canProbe) return null;
-    try {
-      const r = await probeVideoInfoAsync(videoUrl);
-      console.log(`[subtitle] Video: filename="${videoFilename}", duration=${r.duration != null ? `${r.duration.toFixed(1)}s` : 'unknown'}, textSubStreams=${r.subtitleStreams.length}`);
-      return r;
-    } catch {
-      return null;
-    }
-  })();
-
-  // 2c.ii Align: ffsubsync against best English source. Returns offset (or
-  // null on failure/timeout). Runs in parallel with translate so the total
-  // request fits in budget.
-  let alignPromise: Promise<{ offset: number; completed: boolean; method?: string } | null> = Promise.resolve(null);
-  const willAlign = canAlign && sourceWithFormat.length > 0;
-  if (willAlign) {
-    alignPromise = (async () => {
-      // 1. Try fast engine (release-name, sub-consensus, minimal-vad).
-      //    Release name match is instant (<1ms) and needs no probe.
-      const fastBudget = Math.max(2_000, budgetLeftMs() - 6_000);
-      const earlyFast = await calculateOffsetFast(
-        videoUrl!,
-        videoFilename,
-        null,
-        sourceWithFormat,
-        Math.min(fastBudget, 2_000),
-      );
-      if (earlyFast && earlyFast.score >= 0.5 && earlyFast.method === 'release-name') {
-        setOffsetCache(videoUrl!, earlyFast.offset);
-        console.log(
-          `[subtitle] fast-align (instant): offset=${earlyFast.offset.toFixed(3)}s via ${earlyFast.method}` +
-          (earlyFast.offset === 0 ? ' (already synced)' : ''),
-        );
-        return { offset: earlyFast.offset, completed: true, method: earlyFast.method };
-      }
-
-      // If release-name didn't match immediately, wait for video probe (bounded)
-      const probe = await probePromise;
-      const videoDuration = probe?.duration ?? null;
-      // Diagnostic: log what fast-align saw
-      const releaseNames = sourceWithFormat.slice(0, 5).map((s) => ({
-        id: s.id,
-        lang: s.lang || '',
-        url: (s.url || '').slice(-80),
-        release: s._releaseName || '',
-      }));
-      console.log(`[subtitle] fast-align: video="${videoFilename}", sourceSubs=${sourceWithFormat.length}, samples=${JSON.stringify(releaseNames)}`);
-      const fast = await calculateOffsetFast(
-        videoUrl!,
-        videoFilename,
-        videoDuration,
-        sourceWithFormat,
-        fastBudget,
-      );
-      if (fast && fast.score >= 0.5) {
-        setOffsetCache(videoUrl!, fast.offset);
-        console.log(
-          `[subtitle] fast-align: offset=${fast.offset.toFixed(3)}s via ${fast.method}` +
-          (fast.offset === 0 ? ' (already synced)' : ''),
-        );
-        return { offset: fast.offset, completed: true, method: fast.method };
-      }
-      console.log(`[subtitle] fast-align: not confident${fast ? ` (best=${fast.method}@${fast.score.toFixed(2)})` : ''}, escalating to ffsubsync`);
-
-      // 2. Fall back to ffsubsync (slow but reliable). Try the best
-      //    English sub first, then up to 3 more English subs in case
-      //    the first URL is dead (CDN/auth/redirect issues).
-      const englishSubs = sourceWithFormat
-        .filter((s) => {
-          const l = (s.lang || '').toLowerCase();
-          return l === 'en' || l === 'eng';
-        })
-        .slice(0, 4);
-      const candidates = englishSubs.length > 0 ? englishSubs : sourceWithFormat.slice(0, 4);
-      for (const candidate of candidates) {
-        const realUrl = resolveRealUrl(candidate.url);
-        console.log(`[subtitle] ffsubsync: trying ${candidate.id} (url=${realUrl.slice(-60)})`);
-        const subContent = await fetchText(realUrl);
-        if (!subContent) {
-          console.log(`[subtitle] ffsubsync: could not fetch ${candidate.id}, trying next`);
-          continue;
-        }
-        const fmt = (candidate._format || 'srt') as SubtitleFormat;
-        let analysisSrt = subContent;
-        if (fmt !== 'srt') {
-          const entries = parseSubtitle(subContent, fmt);
-          if (entries.length > 0) analysisSrt = reSerialize(entries, 'srt') || subContent;
-        }
-        console.log(`[subtitle] ffsubsync: syncing ${candidate.id} (${analysisSrt.length}B) against video audio...`);
-        const align = await calculateOffsetSmart(
-          videoUrl!,
-          analysisSrt,
-          probe?.subtitleStreams ?? [],
-        );
-        if (align.completed) {
-          setOffsetCache(videoUrl!, align.offset);
-          console.log(
-            `[subtitle] ffsubsync: offset=${align.offset.toFixed(3)}s via ${align.method}` +
-            (align.offset === 0 ? ' (already synced)' : ''),
-          );
-        } else {
-          console.log(`[subtitle] ffsubsync: no definitive offset via ${align.method || 'cascade'}`);
-        }
-        return { offset: align.offset, completed: align.completed, method: align.method };
-      }
-      console.log(`[subtitle] ffsubsync: all ${candidates.length} candidates failed to fetch`);
-      return null;
-    })().catch((e: any) => {
-      console.log(`[subtitle] align: error: ${e?.message?.substring(0, 200)}`);
-      return null;
-    });
-  }
-
-  // 2c.iii Translate: can run in parallel with align. If align finishes
-  // first, the translated entries get the same offset applied to the
-  // source sub's timestamps — so the output is correctly aligned.
+  let allSubs: Subtitle[] = [];
+  let listCacheable = true;
+  let overallOffset = 0;
   let translatePromise: Promise<{ input: LingarrSourceSub[]; translated: Subtitle[] } | null> = Promise.resolve(null);
-  if (config.translateTargets.length === 0) {
-    // No targets — skip
-  } else if (budgetLeftMs() < TRANSLATE_MIN_MS) {
-    console.log(`[translate] skip: budget low (${budgetLeftMs()}ms < ${TRANSLATE_MIN_MS}ms)`);
-  } else {
-    const translateInput: LingarrSourceSub[] = sourceWithFormat.map((s) => ({
-      id: s.id,
-      url: s.url,
-      lang: s.lang,
-      format: s._format,
-      normLang: s.lang ? normalizeLang(s.lang) : '',
-    }));
-    console.log(`[translate] running: targets=[${config.translateTargets.join(',')}] sourceSubs=${translateInput.length} budgetMs=${budgetLeftMs()}`);
+
+  if (targetSubs.length > 0) {
+    // ── SCENARIO A: Target subtitles EXIST ──
+    // "nếu có target sub thì dùng sub chuẩn đó để so lại cho target sub"
+    console.log(`[subtitle] Found ${targetSubs.length} target sub(s) for languages="${config.languages}"`);
+    let refEntries: SubtitleEntry[] | null = null;
+    const candidatesToSync = limitPerLanguage(targetSubs, MAX_SUBS_PER_LANG);
+    const syncedTargetSubs: Subtitle[] = [];
+
+    for (const tSub of candidatesToSync) {
+      const match = scoreReleaseMatch(videoFilename, tSub._releaseName);
+      if (match.matched) {
+        console.log(`[subtitle] target sub ${tSub.id} matches video release (${match.reason}) — already in sync (offset=0)`);
+        syncedTargetSubs.push(tSub);
+        continue;
+      }
+
+      // Target sub does NOT match release -> compare against benchmark sub!
+      if (!refEntries && benchmarkSub) {
+        refEntries = await fetchAndParseSubEntries(benchmarkSub);
+      }
+
+      if (refEntries && refEntries.length >= 3) {
+        const tgtEntries = await fetchAndParseSubEntries(tSub);
+        if (tgtEntries.length >= 3) {
+          const timing = calculateOffsetFromTiming(refEntries, tgtEntries);
+          if (timing.score >= 0.35 && Math.abs(timing.offset) >= 0.25) {
+            console.log(
+              `[subtitle] target sub ${tSub.id} aligned via benchmark: offset=${timing.offset.toFixed(2)}s ` +
+              `(score=${timing.score.toFixed(2)}, matched ${timing.matchedCues}/${timing.totalCues} cues)`
+            );
+            overallOffset = timing.offset;
+            const adjusted = adjustEntries(tgtEntries, timing.offset);
+            const body = Buffer.from(reSerialize(adjusted, 'srt') || '', 'utf-8');
+            const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+            alignedSubCache.set(token, { body, contentType: 'text/plain; charset=utf-8' }, ALIGNED_SUB_TTL_MS);
+            syncedTargetSubs.push({
+              ...tSub,
+              url: `aligned:${token}`,
+              _aligned: true,
+              _entries: adjusted,
+            });
+            continue;
+          }
+        }
+      }
+
+      // If comparison not confident or offset is 0, use directly
+      syncedTargetSubs.push(tSub);
+    }
+
+    allSubs = syncedTargetSubs;
+  } else if (config.translateTargets.length > 0 && sourceSubs.length > 0) {
+    // ── SCENARIO B: NO target subtitles exist -> TRANSLATE ──
+    // "ko có thì dịch": take the benchmark sub (already in sync) and translate it!
+    console.log(`[subtitle] 0 target subs found for "${config.languages}" — translating from benchmark sub (${benchmarkSub?.id || 'source'})`);
+
+    const translateInput: LingarrSourceSub[] = [
+      ...(benchmarkSub ? [{
+        id: benchmarkSub.id,
+        url: benchmarkSub.url,
+        lang: benchmarkSub.lang,
+        format: benchmarkSub._format,
+        normLang: benchmarkSub.lang ? normalizeLang(benchmarkSub.lang) : '',
+      }] : []),
+      ...sourceWithFormat
+        .filter((s) => s.id !== benchmarkSub?.id)
+        .map((s) => ({
+          id: s.id,
+          url: s.url,
+          lang: s.lang,
+          format: s._format,
+          normLang: s.lang ? normalizeLang(s.lang) : '',
+        })),
+    ];
+
     translatePromise = (async () => {
       const out = await runLingarrPipeline({
         subs: translateInput,
@@ -549,91 +456,34 @@ async function subtitlesHandler(req: Request, res: Response) {
         const cacheHitCount = out.log.filter((l) => l.status === 'cache-hit').length;
         const freshCount = out.log.filter((l) => l.status === 'translated').length;
         console.log(`[translate] inserted ${newSubs.length} translated sub(s): ${cacheHitCount} cache, ${freshCount} fresh`);
-        for (const entry of out.log) {
-          console.log(`[translate] ${entry.target} ← ${entry.source || '?'} ${entry.status}${entry.detail ? ` (${entry.detail})` : ''}`);
-        }
         return { input: translateInput, translated: newSubs };
-      } else if (out.log.length > 0) {
-        console.log(`[translate] no translation: ${out.log.length} log entries`);
-        for (const entry of out.log) {
-          console.log(`[translate] ${entry.target} ← ${entry.source || '?'} ${entry.status}${entry.detail ? ` (${entry.detail})` : ''}`);
-        }
       }
       return null;
     })().catch((e: any) => {
       console.log(`[translate] error: ${e?.message?.substring(0, 200)}`);
       return null;
     });
-  }
 
-  // Wait for translate first — bounded by remaining budget so client never hangs.
-  // When budget runs out, let it finish in background to warm cache for subsequent requests.
-  const marginAfterTranslate = (offset !== 0 && offset !== null)
-    ? (RESPONSE_MARGIN_MS + MIN_APPLY_MS)
-    : (RESPONSE_MARGIN_MS + 500);
-  const remainingForTranslate = Math.max(0, budgetLeftMs() - marginAfterTranslate);
-  const translateResult = await Promise.race([
-    translatePromise,
-    sleep(remainingForTranslate).then(() => null),
-  ]);
-  if (translateResult && translateResult.translated.length > 0) {
-    if (usedFallback) {
-      // User only wanted translated language (filter had 0 subs) — prioritize translated subs!
-      allSubs = [...translateResult.translated, ...allSubs];
-    } else {
-      allSubs = [...allSubs, ...translateResult.translated];
-    }
-    allSubs = limitPerLanguage(allSubs, MAX_SUBS_PER_LANG);
-  } else if (config.translateTargets.length > 0) {
-    console.log(`[subtitle] translate exceeded budget (${remainingForTranslate}ms) — serving available subs, continuing in background`);
-    translatePromise.catch(() => {});
-  }
-
-  // Wait for align — usually finishes in parallel with translate.
-  // If alignPromise has already completed (e.g. early fast align), Promise.race resolves instantly (0ms).
-  let listCacheable = true;
-  if (willAlign) {
-    const remainingForAlign = Math.max(0, budgetLeftMs() - RESPONSE_MARGIN_MS);
-    const alignResult = await Promise.race([
-      alignPromise,
-      sleep(remainingForAlign).then(() => null),
+    const remainingForTranslate = Math.max(0, budgetLeftMs() - (RESPONSE_MARGIN_MS + 500));
+    const translateResult = await Promise.race([
+      translatePromise,
+      sleep(remainingForTranslate).then(() => null),
     ]);
-    if (alignResult === null) {
-      alignPromise.catch(() => {});
-      listCacheable = false;
-      console.log(`[subtitle] alignment exceeded budget — serving with offset=${offset}, warming in background`);
-    } else {
-      offset = alignResult.offset;
-      if (!alignResult.completed) listCacheable = false;
-    }
-  }
 
-  // 7. If offset detected, apply to all subs (including translated ones
-  //    that carry `_entries`). Parallel downloads; race against the
-  //    remaining budget so Nuvio never hangs.
-  let alignedSubtitles: Subtitle[] = allSubs;
-  if (offset !== 0) {
-    const remaining = budgetLeftMs() - RESPONSE_MARGIN_MS;
-    if (remaining < MIN_APPLY_MS) {
-      listCacheable = false;
-      console.log(`[subtitle] offset=${offset.toFixed(1)}s known but no time to apply — serving unaligned`);
+    if (translateResult && translateResult.translated.length > 0) {
+      allSubs = translateResult.translated;
     } else {
-      const applyPromise = applyOffsetToSubtitles(allSubs, offset);
-      const raced = await Promise.race([applyPromise, sleep(remaining)]);
-      if (raced === null) {
-        applyPromise.catch(() => {});
-        listCacheable = false;
-        console.log(`[subtitle] applying offset exceeded budget — serving unaligned`);
-      } else {
-        alignedSubtitles = raced;
-      }
+      console.log(`[subtitle] translate running in background — serving available fallback subs`);
+      allSubs = limitPerLanguage(sourceSubs, MAX_SUBS_PER_LANG);
+      listCacheable = false;
     }
   } else {
-    // No offset to apply — still need to materialize translated subs (which carry
-    // `_entries` but no body) into the alignedSubCache so the URL rewrite below
-    // can serve them via /alignedsub/<token>.<ext>.
-    alignedSubtitles = await materializeTranslatedSubs(allSubs);
+    // ── SCENARIO C: No target language filter or translation ──
+    allSubs = limitPerLanguage(sourceWithFormat, MAX_SUBS_PER_LANG);
   }
+
+  // Materialize any subtitles that carry `_entries` (e.g. translated or adjusted)
+  const alignedSubtitles = await materializeTranslatedSubs(allSubs);
 
   // 8. NOW rewrite URLs to proxy format (all content downloads are done)
   const base = `${req.protocol}://${req.headers.host || 'localhost'}`;
@@ -675,7 +525,7 @@ async function subtitlesHandler(req: Request, res: Response) {
     const l = s.lang || 'unknown';
     langCounts[l] = (langCounts[l] || 0) + 1;
   }
-  console.log(`[subtitle] response: ${result.subtitles.length} subs [${Object.entries(langCounts).map(([l, c]) => `${l}:${c}`).join(', ')}], offset=${offset.toFixed(2)}s, listCacheable=${listCacheable}`);
+  console.log(`[subtitle] response: ${result.subtitles.length} subs [${Object.entries(langCounts).map(([l, c]) => `${l}:${c}`).join(', ')}], offset=${overallOffset.toFixed(2)}s, listCacheable=${listCacheable}`);
 
   res.json(result);
 
@@ -712,64 +562,6 @@ async function subtitlesHandler(req: Request, res: Response) {
 router.get('/subtitles/:type/*', subtitlesHandler);
 // Path-segment config: /<config>/subtitles/<type>/<id>.json
 router.get(`/:config(${PATH_SEGMENT_RE})/subtitles/:type/*`, subtitlesHandler);
-
-/** Re-download each subtitle, apply offset, cache aligned SRT under /alignedsub/. */
-async function applyOffsetToSubtitles(subs: Subtitle[], offset: number): Promise<Subtitle[]> {
-  return Promise.all(
-    subs.map(async (sub) => {
-      const format = (sub._format || 'srt') as SubtitleFormat | null;
-      if (!format) return sub;
-      try {
-        let adjustedContent: string | null = null;
-        if (sub._entries && sub._entries.length > 0) {
-          // Translation pipeline already built entries — apply offset, re-serialize.
-          // ASS body is always converted to SRT (Nuvio ICU-safe).
-          const adjusted = adjustEntries(sub._entries, offset);
-          adjustedContent = reSerialize(adjusted, format === 'ass' ? 'srt' : format);
-        } else {
-          const realUrl = resolveRealUrl(sub.url);
-          const subContent = await fetchText(realUrl);
-          if (!subContent) return sub;
-          if (format === 'ass') {
-            // Nuvio Android cannot parse ASS (ICU regex crash on unescaped }).
-            // Convert to SRT after offsetting.
-            const entries = parseSubtitle(subContent, 'ass');
-            if (entries.length > 0) {
-              adjustedContent = reSerialize(adjustEntries(entries, offset), 'srt');
-            }
-          } else {
-            // SRT/VTT: parse → adjust → re-serialize
-            const entries = parseSubtitle(subContent, format);
-            if (entries.length > 0) {
-              const adjusted = adjustEntries(entries, offset);
-              adjustedContent = reSerialize(adjusted, format === 'vtt' ? 'srt' : format);
-            }
-          }
-        }
-
-        if (adjustedContent) {
-          const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
-          alignedSubCache.set(
-            token,
-            {
-              body: Buffer.from(adjustedContent, 'utf-8'),
-              contentType: 'text/plain; charset=utf-8',
-            },
-            ALIGNED_SUB_TTL_MS,
-          );
-          return {
-            ...sub,
-            url: `aligned:${token}`,
-            _aligned: true,
-          };
-        }
-      } catch (e: any) {
-        console.log(`[subtitle] apply offset failed for one sub: ${e.message?.substring(0, 120)}`);
-      }
-      return sub;
-    }),
-  );
-}
 
 /**
  * Serialize pre-built `_entries` from the translation pipeline into
